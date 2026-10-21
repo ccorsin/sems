@@ -8,10 +8,11 @@ leaves).
 Written in Rust (actix-web). The design process, every decision and the alternatives considered
 are traced step by step in [`JOURNAL.md`](JOURNAL.md).
 
-> Current version: **V3.1** — max-min fair water-filling (no power left unused while a vehicle
-> could take it) and **safe transitions**: a decrease is applied before any increase, so the
-> grid is never exceeded, even while chargers apply their new setpoints. Earlier versions are on
-> branches `v1` and `v2`. See the [roadmap](#roadmap).
+> Current version: **V3.2** — max-min fair water-filling (no power left unused while a vehicle
+> could take it), **safe transitions** (a decrease is applied before any increase, so the grid
+> is never exceeded, even while chargers apply their new setpoints) and a live **OPS view**
+> (connector and charger availability, power availability). Earlier versions are on branches
+> `v1` and `v2`. See the [roadmap](#roadmap).
 
 ## Quick start
 
@@ -259,6 +260,25 @@ acknowledgements go over HTTP. Closing the WebSocket releases nothing (see limit
 | `target_kw` | What the allocator would give; above `setpoint_kw` while an increase is held |
 | `pending_acks` | Station level: chargers whose acknowledgement is awaited, with the version to acknowledge |
 | `version` | Charger level: version of its latest setpoints |
+| `online`, `online_since_ms` | Charger level: a setpoint WebSocket is open, and since when it is online or offline |
+| `available_kw` (charger) | Charger headroom: `max_kw − allocated_kw` (not necessarily usable: the grid may be saturated) |
+
+### OPS view
+
+The brief asks to *"let Electra OPS see the live state of the station (connector and charger
+availability, power availability…)"*. All of it is in `GET /status`, read at any time:
+
+| The brief asks for | Where in `GET /status` |
+|---|---|
+| **Connector availability** | `chargers[].connectors[].status`: `available`, `charging`, `suspended_ev` (plugged in, the vehicle requests nothing), `suspended_evse` (plugged in, the station gives nothing yet), with `status_since_ms` |
+| **Charger availability** | `chargers[].online` (its setpoint WebSocket is open) and `online_since_ms` |
+| **Power availability** | Station: `grid_kw`, `allocated_kw`, `available_kw`, `unserved_kw`. Charger: `max_kw`, `allocated_kw`, `available_kw`, `unserved_kw`. Session: `demand_kw`, `setpoint_kw`, `target_kw` |
+| What is blocking | `pending_acks`: chargers whose acknowledgement holds increases |
+| What happened | `GET /events`: every accepted event with the allocation that resulted from it |
+
+A charger going offline **releases nothing**: it may still be drawing power, so its sessions
+keep their setpoints and, if it owed an acknowledgement, it stays in `pending_acks`. OPS sees
+both facts side by side.
 | `allocated_kw` | Sum of setpoints |
 | `available_kw` | Grid headroom (not necessarily usable: a charger may be saturated) |
 | `unserved_kw` | Unmet demand: Σ (demand − setpoint) |
@@ -339,8 +359,11 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
   holds increases on unrelated chargers, and an increase that would already fit is held too.
   A finer barrier would serve faster at the cost of more logic.
 - A charger that disappears without ending its session keeps its power reserved (safety first);
-  OPS can end its sessions with `DELETE /sessions/{id}`, which does not lift a pending
-  acknowledgement.
+  OPS sees it `online: false` and can end its sessions with `DELETE /sessions/{id}`, which does
+  not lift a pending acknowledgement.
+- `online` means "reachable for setpoint push": a charger that only polls
+  `GET /chargers/{id}/setpoints` shows as offline. Connections and disconnections are logged on
+  stdout, not recorded in `/events`.
 
 ## Performance
 
@@ -458,6 +481,6 @@ so their figures include the time spent waiting for acknowledgements):
 | **V1** ✅ | REST API, scenarios, Docker, WebSocket push of setpoints, `/events` history, allocation metrics, end-to-end performance tests |
 | **V2** ✅ | Max-min fair water-filling: no waste, released power goes to the other sessions; randomized property test (random stations and events, properties at every step) |
 | **V3.1** ✅ | Safe transitions: decrease before increase, versioned acknowledgements over HTTP, transition invariant checked everywhere |
-| V3.2 | Offline chargers visible to OPS (WebSocket lost); timeout for a charger that never acknowledges |
-| Later | Minimum viable power per session (UX more than safety); finer acknowledgement barrier |
+| **V3.2** ✅ | OPS view: charger availability (`online`, `online_since_ms`) and available power per charger |
+| Later | Timeout for a charger that never acknowledges; minimum viable power per session (UX more than safety); finer acknowledgement barrier |
 | V4 | Battery storage (BESS): boost, 10% SoC floor, opportunistic charging |

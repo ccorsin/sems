@@ -148,7 +148,8 @@ pub struct Session {
     pub started_at_ms: u64,
 }
 
-/// Delivery state of a charger's setpoints ("decrease before increase").
+/// Link with a charger: delivery of its setpoints ("decrease before increase") and whether it
+/// can be reached.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChargerLink {
     /// `seq` of the event that last changed this charger's published setpoints; the charger
@@ -157,6 +158,17 @@ pub struct ChargerLink {
     /// A decrease was published and not acknowledged yet: increases are held station-wide.
     /// While awaited, a charger's setpoints can only go down, so `version` is the one awaited.
     pub awaiting: bool,
+    /// Open setpoint channels (WebSockets): a charger may open several.
+    pub connections: u32,
+    /// When the charger last went online or offline.
+    pub online_since_ms: u64,
+}
+
+impl ChargerLink {
+    /// Reachable for setpoint push. Derived, so it cannot drift from the connection count.
+    pub fn online(&self) -> bool {
+        self.connections > 0
+    }
 }
 
 /// Connector status, derived from its session (names borrowed from OCPP).
@@ -278,7 +290,13 @@ impl Station {
             })
             .collect();
         Station {
-            links: vec![ChargerLink::default(); config.chargers.len()],
+            links: vec![
+                ChargerLink {
+                    online_since_ms: now_ms,
+                    ..ChargerLink::default()
+                };
+                config.chargers.len()
+            ],
             config,
             slots,
             history: VecDeque::new(),
@@ -386,6 +404,21 @@ impl Station {
     /// Chargers whose acknowledgement is awaited (indices, config order).
     pub fn awaited(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.links.len()).filter(|&c| self.links[c].awaiting)
+    }
+
+    /// A charger opened (`up`) or closed a setpoint channel. Shown to OPS only: it never changes
+    /// the allocation, since a charger out of reach may still be drawing power (safety first).
+    pub fn set_link(&mut self, charger: usize, up: bool, now_ms: u64) {
+        let link = &mut self.links[charger];
+        let was_online = link.online();
+        link.connections = if up {
+            link.connections + 1
+        } else {
+            link.connections.saturating_sub(1)
+        };
+        if link.online() != was_online {
+            link.online_since_ms = now_ms;
+        }
     }
 
     /// Active sessions with their `(charger, connector)` indices.
@@ -681,6 +714,31 @@ mod tests {
 
         assert_eq!(st.ack("CP9", 1, 0), Err(EventError::UnknownCharger));
         assert_eq!(st.ack("CP1", 99, 0), Err(EventError::FutureVersion));
+    }
+
+    #[test]
+    fn charger_online_while_a_channel_is_open() {
+        let mut st = station();
+        let a = st.connect("CP1", 1, 300 * KW, 0).unwrap();
+        assert!(!st.links[0].online(), "never connected: offline");
+        assert_eq!(st.links[0].online_since_ms, 0);
+
+        st.set_link(0, true, 10);
+        st.set_link(0, true, 20);
+        assert!(st.links[0].online());
+        assert_eq!(
+            st.links[0].online_since_ms, 10,
+            "second channel: still online since 10"
+        );
+
+        st.set_link(0, false, 30);
+        assert!(st.links[0].online(), "one channel left");
+        st.set_link(0, false, 40);
+        assert!(!st.links[0].online());
+        assert_eq!(st.links[0].online_since_ms, 40);
+
+        // Going offline releases nothing: the charger may still be drawing power.
+        assert_eq!(setpoint(&st, a), 300 * KW);
     }
 
     #[test]

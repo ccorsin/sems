@@ -126,6 +126,11 @@ pub fn check_consistency(status: &Value) -> Result<(), String> {
             num(&charger["unserved_kw"]),
             charger_unserved,
         )?;
+        close(
+            "charger available_kw",
+            num(&charger["available_kw"]),
+            num(&charger["max_kw"]) - charger_allocated,
+        )?;
         allocated += charger_allocated;
         unserved += charger_unserved;
     }

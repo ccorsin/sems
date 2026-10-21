@@ -194,9 +194,10 @@ async fn setpoints(
     req: HttpRequest,
     body: web::Payload,
 ) -> actix_web::Result<HttpResponse> {
-    let Some(tx) = state.push.iter().find(|tx| tx.borrow().charger == *id) else {
+    let Some(c) = state.push.iter().position(|tx| tx.borrow().charger == *id) else {
         return Ok(error(StatusCode::NOT_FOUND, "unknown charger"));
     };
+    let tx = &state.push[c];
     let upgrade = req.headers().get(header::UPGRADE);
     if !upgrade.is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket")) {
         return Ok(HttpResponse::Ok().json(&*tx.borrow()));
@@ -205,10 +206,14 @@ async fn setpoints(
     let (response, session, messages) = actix_ws::handle(&req, body)?;
     let rx = tx.subscribe();
     let charger = id.into_inner();
+    let state = state.clone();
+    lock(&state).set_link(c, true, now_ms());
     actix_web::rt::spawn(async move {
         println!("ws_connected charger={charger}");
         push_setpoints(session, messages, rx).await;
-        // The session keeps its power: a silent charger may still be delivering (safety first).
+        // Offline for OPS, but the sessions keep their power: a charger out of reach may still
+        // be delivering (safety first).
+        lock(&state).set_link(c, false, now_ms());
         println!("ws_disconnected charger={charger}");
     });
     Ok(response)
@@ -482,9 +487,15 @@ struct ChargerView {
     id: String,
     max_kw: f64,
     allocated_kw: f64,
+    /// Charger headroom; not necessarily usable (the grid may be saturated).
+    available_kw: f64,
     unserved_kw: f64,
     /// Version of its latest setpoints.
     version: u64,
+    /// At least one setpoint WebSocket is open (a pull-only charger shows as offline).
+    online: bool,
+    /// When it last went online or offline.
+    online_since_ms: u64,
     connectors: Vec<ConnectorView>,
 }
 
@@ -525,12 +536,16 @@ impl StatusView {
             .zip(&st.links)
             .map(|((charger, slots), link)| {
                 let sessions = || slots.iter().filter_map(|slot| slot.session.as_ref());
+                let allocated_w: Watts = sessions().map(|s| s.setpoint_w).sum();
                 ChargerView {
                     id: charger.id.clone(),
                     max_kw: kw(charger.max_w),
-                    allocated_kw: kw(sessions().map(|s| s.setpoint_w).sum()),
+                    allocated_kw: kw(allocated_w),
+                    available_kw: kw(charger.max_w - allocated_w),
                     unserved_kw: kw(sessions().map(|s| s.demand_w - s.setpoint_w).sum()),
                     version: link.version,
+                    online: link.online(),
+                    online_since_ms: link.online_since_ms,
                     connectors: charger
                         .connectors
                         .iter()

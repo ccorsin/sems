@@ -16,7 +16,8 @@ invariant "Σ ≤ grid" simple, in microseconds. Powers are integer watts rounde
 can exceed a limit by rounding. The allocator is a pure function, separate from the API.
 Channels follow who speaks first: chargers send events and acknowledgements over HTTP; the
 server pushes setpoints over a WebSocket per charger (`/chargers/{id}/setpoints`, also readable
-by a plain GET). OPS reads `/status` and the history `/events`, where each event is stored with
+by a plain GET). OPS reads `/status` (connector and charger availability, power availability at
+station, charger and session level) and the history `/events`, where each event is stored with
 the allocation that resulted from it.
 
 **Versions.**
@@ -26,6 +27,7 @@ the allocation that resulted from it.
 | V1 | Capped equal share: `min(demand, connector, grid / n, charger / n_charger)`; REST API, `/status`, `/events`, WebSocket push, Docker | Safe, but up to 166.7 kW unused in the scenarios |
 | V2 | Max-min fair water-filling, first inside each charger, then across the grid | 0 kW unused in every scenario; end-to-end latency unchanged |
 | V3.1 | Decrease before increase: decreases are published at once; increases wait until every charger with a pending decrease acknowledges its latest version (`POST /chargers/{id}/ack`, version = event `seq`) | 0 kW of transition overshoot on every transition; a charger that never acknowledges freezes increases (documented limitation) |
+| V3.2 | OPS view completed: each charger's `online` status (a setpoint WebSocket is open) with `online_since_ms`, and available power per charger | Every item the brief lists for OPS is in `/status`; going offline releases nothing |
 
 **Tests.** Unit tests on configuration, model and allocator; 20 declarative JSON scenarios, each
 with its `why`, replayed through the API with four properties checked after every request
@@ -41,8 +43,8 @@ concurrent burst with the safety invariant checked on every response.
 **Assumptions.** Power modelled in kW, continuously divisible (no stacks); one server per
 station; a setpoint received is applied at once; state in memory; no authentication.
 
-**Next.** V3.2: offline chargers visible to OPS, and a timeout for a charger that never
-acknowledges. Later: minimum viable power per session.
+**Next.** A timeout for a charger that never acknowledges; battery storage (BESS); minimum
+viable power per session.
 
 ---
 
@@ -917,3 +919,28 @@ and timeout idea with its caveat), API (ack route, `version`, `target_kw`, `pend
 quick start with an acknowledgement, scenarios S18–S20, metrics V2 → V3 (overshoot 0 everywhere,
 and the price of safety while acknowledgements are pending), performance (V3 ranges over 3
 runs: P1 max 404–642 µs, P2 5,000–5,500 events/s).
+
+---
+
+## Step 15 — V3.2: OPS view completed (2026-10-21)
+
+The brief asks to let OPS see "connector and charger availability, power availability". Connector
+availability (statuses) and station power were already in `/status`; charger availability and
+per-charger power were missing.
+
+**Scope**: `src/model.rs` (`ChargerLink.connections`, `online_since_ms`, `Station::set_link`),
+`src/api.rs` (WebSocket open/close update the link; `online`, `online_since_ms`, `available_kw`
+per charger in `/status`), tests, README ("OPS view" section mapping the brief's words to the
+fields).
+
+- **Online = at least one setpoint WebSocket open**: a connection count (a charger may open
+  several), `online` derived from it, `online_since_ms` stamped on each change.
+- **Going offline releases nothing**: the charger may still be drawing power; its sessions keep
+  their setpoints and, if it owed an acknowledgement, it stays in `pending_acks`.
+- **Kept minimal**: connections are logged on stdout, not recorded in `/events`; a pull-only
+  charger shows as offline (documented).
+- **Tests**: model unit test (two channels, one closed: still online; both closed: offline,
+  allocation unchanged), push test against a real server (offline, online once the WebSocket
+  opens, offline once it closes, 300 kW kept), consistency check `available_kw = max_kw −
+  allocated_kw` per charger in every scenario and random step. A deliberate bug (never marking
+  a charger offline) makes the push test fail.
