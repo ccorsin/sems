@@ -15,6 +15,14 @@ are traced step by step in [`JOURNAL.md`](JOURNAL.md).
 > (boost, 10 % state-of-charge floor, opportunistic charging). Earlier versions are on branches
 > `v1`, `v2` and `v3`. See the [roadmap](#roadmap).
 
+**Contents** — [Quick start](#quick-start) · [Station configuration](#station-configuration) ·
+[Run the tests](#run-the-tests) · [Communication](#communication-who-speaks-first) ·
+[Safe transitions](#safe-transitions-decrease-before-increase) ·
+[Battery storage](#battery-storage-bess) · [API](#api) · [OPS view](#ops-view) ·
+[Key decisions](#key-decisions) · [Assumptions and limitations](#assumptions-and-limitations) ·
+[Known risks](#known-risks-assumed-not-solved) · [Performance](#performance) ·
+[Allocation metrics](#allocation-metrics-v1--v2--v3) · [Roadmap](#roadmap)
+
 ## Quick start
 
 Requires Docker only.
@@ -24,8 +32,8 @@ docker compose up --build        # server on http://localhost:8080, brief's stat
 ```
 
 The default station (`config/station.json`) is the brief's: a 400 kW grid and 2 chargers of
-300 kW with 2 CCS connectors each. Another station is a JSON file mounted in place of it
-(see `docker-compose.yml`).
+300 kW with 2 CCS connectors each. Any other station is just another JSON file, see
+[Station configuration](#station-configuration).
 
 Try it with `curl`:
 
@@ -59,6 +67,50 @@ curl localhost:8080/status
 ```
 
 The server logs one line per accepted event on stdout (`docker compose logs -f sems`).
+
+## Station configuration
+
+The system adapts to the station from a description of it: a JSON file given at startup.
+Nothing about a station is in the code.
+
+```json
+{
+  "grid_kw": 250,
+  "chargers": [
+    { "id": "HPC1", "max_kw": 300,
+      "connectors": [ { "id": 1, "type": "CCS" }, { "id": 2, "type": "CCS", "max_kw": 150 } ] },
+    { "id": "DC50", "max_kw": 50, "connectors": [ { "id": 1, "type": "CCS" } ] },
+    { "id": "AC22", "max_kw": 22,
+      "connectors": [ { "id": 1, "type": "Type2" }, { "id": 2, "type": "Type2" } ] }
+  ],
+  "bess": { "capacity_kwh": 200, "max_kw": 150 }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `grid_kw` | Power of the grid connection: a hard limit |
+| `chargers[].id`, `max_kw` | Each charger and the power its connectors share |
+| `connectors[].id` | Numbered per charger, as in OCPP |
+| `connectors[].max_kw` | Optional: defaults to the charger's |
+| `connectors[].type` | Optional, informational (`CCS`, `Type2`…) |
+| `bess` | Optional battery: energy (`capacity_kwh`) and charge/discharge power (`max_kw`) |
+
+**Validated at startup**: powers above 0 (and at most 1 GW), at least one charger, at least one
+connector per charger, unique ids, no connector more powerful than its charger, no unknown field
+(a typo such as `max_kW` is reported). An invalid file stops the server with a clear message,
+e.g. `charger A connector 1: more powerful than its charger`.
+
+Two examples: `config/station.json` (the brief's station) and `config/station_bess.json`
+(heterogeneous chargers — 300 kW DC, 50 kW DC, 2 × 22 kW AC — and a BESS).
+
+```bash
+SEMS_CONFIG=./config/station_bess.json docker compose up --build   # with Docker
+cargo run --release -- config/station_bess.json                     # natively
+```
+
+The scenarios bring their own stations (inline in each file), from 1 to 10 chargers, with and
+without BESS; the randomized test generates hundreds of random ones.
 
 ## Run the tests
 

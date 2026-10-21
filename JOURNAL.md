@@ -1064,3 +1064,13 @@ section split in two: atomicity comes from the design (one locked section per ev
 the same lock, validate before mutating). A dedicated concurrency test was written, then removed
 for simplicity: the property is documented as a checked property, covered by S11, the history
 property, the randomized test and the burst test P2.
+
+## Step 23 — Station configuration made explicit (2026-10-21)
+
+The system already read the station from a JSON file given at startup, validated it and failed
+fast on errors, but this was neither documented nor easy to demonstrate. Added: a "Station
+configuration" README section (format, defaults, validation, examples), a second example
+`config/station_bess.json` (heterogeneous chargers and a BESS), and `SEMS_CONFIG` in
+`docker-compose.yml` to start any station. Checked in the container: both examples start, an
+invalid file is refused at startup with its message. Also a table of contents at the top of the
+README.
