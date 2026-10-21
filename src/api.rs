@@ -1,22 +1,61 @@
-//! HTTP API: chargers report session events, OPS queries the station state.
+//! HTTP API: chargers report session events and receive their setpoints, OPS queries the
+//! station state.
 //!
 //! The model works in watts; this layer converts to and from kW and maps errors to HTTP codes.
 //! Every event response embeds the full station state: a convenience for demos and tests
 //! (a real charger should only see its own setpoints).
 //!
+//! Setpoints reach chargers through `/chargers/{id}/setpoints`: a plain GET returns them (pull),
+//! a WebSocket upgrade on the same URL streams every change (push). Each charger has a
+//! `watch` channel holding its latest setpoints: a slow client only ever gets the newest value,
+//! never a backlog of stale ones.
+//!
 //! Rule: no I/O under the station lock. Responses and log lines are built while holding it,
-//! then written after it is released.
+//! then written after it is released. Publishing to the `watch` channels is in-memory and done
+//! under the lock, so concurrent events are published in the order they were applied.
 
 use crate::model::{kw_to_w, EventError, Station, Status, Watts};
-use actix_web::{error::InternalError, http::StatusCode, web, HttpResponse};
+use actix_web::{
+    dev::Server, error::InternalError, http::header, http::StatusCode, web, App, HttpRequest,
+    HttpResponse, HttpServer,
+};
+use actix_ws::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Mutex;
+use std::net::TcpListener;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 use uuid::Uuid;
 
-/// Station shared by all server workers.
-pub type AppState = web::Data<Mutex<Station>>;
+/// State shared by all server workers.
+pub struct Shared {
+    station: Mutex<Station>,
+    /// One channel per charger, in config order, holding its latest setpoints.
+    push: Vec<watch::Sender<ChargerSetpoints>>,
+}
+
+/// Handle on the shared state, as received by handlers.
+pub type AppState = web::Data<Shared>;
+
+impl Shared {
+    pub fn new(station: Station) -> AppState {
+        let push = (0..station.config.chargers.len())
+            .map(|c| watch::channel(ChargerSetpoints::of(&station, c)).0)
+            .collect();
+        web::Data::new(Shared {
+            station: Mutex::new(station),
+            push,
+        })
+    }
+}
+
+/// Starts the HTTP server on an already bound listener (port 0 in tests).
+pub fn serve(station: Station, listener: TcpListener) -> std::io::Result<Server> {
+    let state = Shared::new(station);
+    let server = HttpServer::new(move || App::new().app_data(state.clone()).configure(configure));
+    Ok(server.listen(listener)?.run())
+}
 
 /// Registers the routes. The caller provides the [`AppState`] through `App::app_data`.
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -28,7 +67,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/sessions", web::post().to(start_session))
         .route("/sessions/{id}", web::put().to(change_demand))
         .route("/sessions/{id}", web::delete().to(end_session))
-        .route("/status", web::get().to(status));
+        .route("/status", web::get().to(status))
+        .route("/chargers/{id}/setpoints", web::get().to(setpoints));
 }
 
 /// Current time in milliseconds since the Unix epoch.
@@ -93,8 +133,69 @@ async fn status(state: AppState) -> HttpResponse {
     HttpResponse::Ok().json(view)
 }
 
-/// Applies an event under the lock, then logs it and answers with the session's setpoint
-/// and the full station state.
+/// A charger's setpoints: JSON snapshot on a plain GET (pull), stream of changes on a
+/// WebSocket upgrade (push). Reads the `watch` channel, never the station lock.
+async fn setpoints(
+    state: AppState,
+    id: web::Path<String>,
+    req: HttpRequest,
+    body: web::Payload,
+) -> actix_web::Result<HttpResponse> {
+    let Some(tx) = state.push.iter().find(|tx| tx.borrow().charger == *id) else {
+        return Ok(error(StatusCode::NOT_FOUND, "unknown charger"));
+    };
+    let upgrade = req.headers().get(header::UPGRADE);
+    if !upgrade.is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket")) {
+        return Ok(HttpResponse::Ok().json(&*tx.borrow()));
+    }
+
+    let (response, session, messages) = actix_ws::handle(&req, body)?;
+    let rx = tx.subscribe();
+    let charger = id.into_inner();
+    actix_web::rt::spawn(async move {
+        println!("ws_connected charger={charger}");
+        push_setpoints(session, messages, rx).await;
+        // The session keeps its power: a silent charger may still be delivering (safety first).
+        println!("ws_disconnected charger={charger}");
+    });
+    Ok(response)
+}
+
+/// Sends the current setpoints, then one message per change, until the client goes away.
+async fn push_setpoints(
+    mut session: actix_ws::Session,
+    mut messages: actix_ws::MessageStream,
+    mut rx: watch::Receiver<ChargerSetpoints>,
+) {
+    loop {
+        let text = serde_json::to_string(&*rx.borrow_and_update()).unwrap_or_default();
+        if session.text(text).await.is_err() {
+            return;
+        }
+        // Wait for the next change, answering pings meanwhile. Charger messages are ignored:
+        // events go through the REST routes.
+        loop {
+            tokio::select! {
+                changed = rx.changed() => match changed {
+                    Ok(()) => break,
+                    Err(_) => return,
+                },
+                incoming = messages.recv() => match incoming {
+                    Some(Ok(Message::Ping(bytes))) => {
+                        if session.pong(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                    Some(Ok(_)) => {}
+                },
+            }
+        }
+    }
+}
+
+/// Applies an event under the lock and publishes the chargers' new setpoints, then logs it
+/// and answers with the session's setpoint and the full station state.
 fn run_event(
     state: &AppState,
     code: StatusCode,
@@ -107,6 +208,17 @@ fn run_event(
             Ok(id) => id,
             Err(e) => return event_error(e),
         };
+        // Only chargers whose setpoints actually changed are notified.
+        for (c, tx) in state.push.iter().enumerate() {
+            let new = ChargerSetpoints::of(&st, c);
+            tx.send_if_modified(|current| {
+                let changed = *current != new;
+                if changed {
+                    *current = new;
+                }
+                changed
+            });
+        }
         let setpoint_w = st
             .sessions()
             .find(|(_, _, s)| s.id == id)
@@ -117,16 +229,17 @@ fn run_event(
             status: StatusView::of(&st),
         }
     };
+    // Logs are for humans: 0.1 kW. The API keeps watt precision.
     println!(
-        "{kind} session={} setpoint={}kW station_allocated={}kW",
+        "{kind} session={} setpoint={:.1}kW station_allocated={:.1}kW",
         response.session_id, response.setpoint_kw, response.status.allocated_kw
     );
     HttpResponse::build(code).json(response)
 }
 
-fn lock(state: &AppState) -> std::sync::MutexGuard<'_, Station> {
+fn lock(state: &AppState) -> MutexGuard<'_, Station> {
     // A poisoned lock means a panic mid-update: the state may be inconsistent, so fail loudly.
-    state.lock().expect("station lock poisoned")
+    state.station.lock().expect("station lock poisoned")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -160,6 +273,40 @@ fn event_error(e: EventError) -> HttpResponse {
 
 fn kw(w: Watts) -> f64 {
     w as f64 / 1000.0
+}
+
+/// What a charger receives: the setpoint of each of its connectors (0 kW when free).
+#[derive(Serialize, Clone, PartialEq)]
+struct ChargerSetpoints {
+    charger: String,
+    setpoints: Vec<ConnectorSetpoint>,
+}
+
+#[derive(Serialize, Clone, PartialEq)]
+struct ConnectorSetpoint {
+    connector: u32,
+    session_id: Option<Uuid>,
+    kw: f64,
+}
+
+impl ChargerSetpoints {
+    fn of(st: &Station, charger: usize) -> Self {
+        let config = &st.config.chargers[charger];
+        let setpoints = config
+            .connectors
+            .iter()
+            .zip(&st.slots[charger])
+            .map(|(connector, slot)| ConnectorSetpoint {
+                connector: connector.id,
+                session_id: slot.session.as_ref().map(|s| s.id),
+                kw: kw(slot.session.as_ref().map_or(0, |s| s.setpoint_w)),
+            })
+            .collect();
+        ChargerSetpoints {
+            charger: config.id.clone(),
+            setpoints,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -264,7 +411,7 @@ impl StatusView {
 mod tests {
     use super::*;
     use crate::model::Config;
-    use actix_web::{test, App};
+    use actix_web::test;
 
     // Error paths not expressible as scenario steps (the runner always sends well-formed requests).
     #[actix_web::test]
@@ -272,7 +419,7 @@ mod tests {
         let cfg = Config::from_json(
             r#"{ "grid_kw": 10, "chargers": [ { "id": "A", "max_kw": 10, "connectors": [ { "id": 1 } ] } ] }"#,
         );
-        let state = web::Data::new(Mutex::new(Station::new(cfg.unwrap(), 0)));
+        let state = Shared::new(Station::new(cfg.unwrap(), 0));
         let app = test::init_service(App::new().app_data(state).configure(configure)).await;
 
         let cases = [

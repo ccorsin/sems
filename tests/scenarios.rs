@@ -7,11 +7,11 @@
 //! Sessions are named by aliases (`"as": "A"`) since the server generates the UUIDs.
 //! An unknown alias maps to a random UUID, to exercise the "unknown session" path.
 
-use actix_web::{test, web, App};
+use actix_web::{test, App};
 use sems::{api, model::Config, model::Station};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, sync::Mutex};
+use std::{collections::HashMap, fs};
 use uuid::Uuid;
 
 /// Tolerance when comparing kW values: 1 W.
@@ -112,7 +112,7 @@ async fn run(scenario: &Scenario) -> Result<(), String> {
     let station = Station::new(Config::from_json(&config_json)?, 0);
     let app = test::init_service(
         App::new()
-            .app_data(web::Data::new(Mutex::new(station)))
+            .app_data(api::Shared::new(station))
             .configure(api::configure),
     )
     .await;

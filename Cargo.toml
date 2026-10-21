@@ -7,6 +7,16 @@ description = "Station Energy Management System: load management for an EV charg
 [dependencies]
 # Default features (compression, cookies, HTTP/2) are not needed: ~30 fewer crates to build.
 actix-web = { version = "4", default-features = false, features = ["macros"] }
+actix-ws = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Already pulled in by actix-web: `watch` channels for setpoint push, `select!` in the WS loop.
+tokio = { version = "1", features = ["sync", "macros"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# actix's own HTTP and WebSocket client, to test against a running server.
+awc = { version = "3", default-features = false }
+# `StreamExt::next` on the WebSocket stream (already pulled in by actix-web).
+futures-util = "0.3"
+tokio = { version = "1", features = ["time"] }

@@ -162,7 +162,7 @@ Three levels, plus performance:
 |---|---|---|
 | Unit | The pure allocation algorithm | `#[test]` in `allocator.rs` |
 | Scenarios | End-to-end behaviour through the API: event sequences → expected state | Declarative JSON files in `scenarios/`, replayed by a Rust runner against the in-process router |
-| Push | WebSocket clients receive new setpoints | Rust tests with `tokio-tungstenite` (dev-dependency) |
+| Push | WebSocket clients receive new setpoints | Rust tests with `awc` (dev-dependency, see increment 4) |
 | Performance | Latency, burst throughput, algorithm scaling | `tests/perf.rs`, `#[ignore]`, run with `cargo test --release -- --ignored` |
 
 **Scenario format (option B)**, chosen over Rust-only tests (less readable for a non-Rust
@@ -223,8 +223,8 @@ The safety invariant is not a scenario: it is checked automatically at every ste
 | P2 | Burst: thousands of concurrent demand changes | No degradation under load, no lock contention, invariant holds |
 | P3 | Algorithm scaling: 4, 100, 10,000 sessions | Computation in µs, linear growth |
 
-- A real server on a random local port; requests sent with `reqwest` (no default features,
-  dev-dependency only, never in the shipped binary).
+- A real server on a random local port; requests sent with `awc` (no default features,
+  dev-dependency only, never in the shipped binary; initially `reqwest`, see increment 4).
 - Assertion: `max < 1 s` (the requirement). Actual figures are printed and reported in the README
   (measured natively on a 2017 MacBook Pro; inside Docker on macOS a VM adds latency, so the
   measurement context is always stated). No tight threshold, to avoid flaky tests on slow machines.
@@ -369,8 +369,10 @@ sequence of `allocated_kw`), and safety audit (`allocated_kw ≤ grid_kw` on eve
 
 ### Push (server → chargers)
 
-**`GET /ws/chargers/{id}`** (WebSocket): on connection, the server sends the current setpoints,
-then one message whenever a setpoint of that charger changes.
+**`GET /chargers/{id}/setpoints`** — *revised in increment 4, initially `/ws/chargers/{id}`*:
+with a WebSocket upgrade, the server sends the current setpoints, then one message whenever a
+setpoint of that charger changes; as a plain GET, it returns the current setpoints (pull
+fallback). Every connector is listed, free ones at 0 kW with `session_id: null`.
 
 ```json
 { "charger": "CP1", "setpoints": [ { "connector": 1, "session_id": "9f1c…", "kw": 150 } ] }
@@ -461,8 +463,10 @@ computation: latency will be dominated by the network, as expected.
 - **Uniform JSON errors**: malformed bodies, missing fields and wrong types go through a custom
   `JsonConfig` error handler (422); an invalid UUID in the URL is a 404 "unknown session". Both
   are covered by a unit test in `api.rs`, since the scenario runner only sends well-formed requests.
-- **Log line simplified**: `session_started session=<id> setpoint=300kW station_allocated=300kW`
+- **Log line simplified**: `session_started session=<id> setpoint=300.0kW station_allocated=300.0kW`
   (no charger/connector, which is gone after a disconnect). Built under the lock, printed after.
+  *Revised in increment 4*: log values are rounded to 0.1 kW for readability (`166.7kW` instead
+  of `166.666kW`); the API keeps watt precision, and auditing relies on the API, not the logs.
 - **Runner checks `GET /status` after every step** (rather than the event response), so error
   steps and observation-only steps are checked the same way.
 - **Scenario format details**: `config` is either inline or a path (`"config/station.json"`) to
@@ -513,3 +517,43 @@ docker compose run --rm test     # unit tests + scenarios
 - **README is minimal on purpose**: quick start, tests, scenarios, API, key decisions,
   limitations, performance, roadmap. The full architecture/trade-offs section comes at the end
   of V1; `JOURNAL.md` holds the detailed reasoning meanwhile.
+
+---
+
+## Step 4 — V1, increment 4: setpoint push over WebSocket (2026-10-21)
+
+**Scope**: `src/api.rs` (route `/chargers/{id}/setpoints`, one `watch` channel per charger,
+`api::serve`), `src/main.rs` (uses `api::serve`), `tests/push.rs`, README (API section).
+
+**Result**: 17 unit tests + 15 scenarios + 3 push tests pass, `clippy` clean. The push tests were
+checked against a deliberate bug (notify every charger on every event): 2 of 3 fail as expected.
+Three consecutive runs pass (no flakiness).
+
+| Push test | Checks |
+|---|---|
+| `other_charger_is_told_without_asking` | Initial snapshot; A on CP1 gets 300 kW; B arrives on CP2 → **CP1 receives A = 200 kW without having sent anything**, CP2 receives B = 200 kW; a plain GET returns what was last pushed |
+| `no_message_when_setpoints_do_not_change` | A (100 kW, below its share) is not disturbed by B's arrival: no message within 200 ms |
+| `unknown_charger_is_404` | JSON 404 on GET, WebSocket handshake refused |
+
+**Decisions**
+
+- **Route `/chargers/{id}/setpoints`** (resource-oriented) chosen over `/ws/chargers/{id}`
+  (transport in the URL) and `/ocpp/{id}` (misleading: we do not speak OCPP). The same URL
+  serves a JSON snapshot on a plain GET and a stream on a WebSocket upgrade, which also gives
+  chargers the missing **pull fallback** for their own setpoints (`/status` is meant for OPS).
+- **`tokio::sync::watch`, one per charger**: it keeps only the latest value, so a slow client
+  never receives a backlog of stale setpoints (a `broadcast` channel would queue them).
+- **Publishing under the lock** with `send_if_modified`: in-memory only, and it guarantees that
+  concurrent events are published in the order they were applied. Only chargers whose
+  setpoints changed are woken up.
+- **Pull reads the channel, not the station lock**: a charger polling its setpoints never
+  contends with event processing.
+- **WebSocket closing releases nothing** (safety first, see assumptions); it is logged
+  (`ws_connected` / `ws_disconnected`), groundwork for the V3 `offline` status.
+- **Test clients: `awc`** (actix's own HTTP + WebSocket client, no default features) and
+  `futures-util` (for `StreamExt::next`, already pulled in by actix-web). Testing push needs a
+  real server and real clients; `actix-ws` is server-side only. A first version used `reqwest` +
+  `tokio-tungstenite`: replaced by `awc`, one client for both protocols, same ecosystem as the
+  server (which the developer knows), and lighter since it reuses `actix-http`: the dev build
+  went from 199 to **165 crates** (154 for the binary alone). `api::serve(station, listener)`
+  was extracted from `main.rs` so tests can start a server on port 0.

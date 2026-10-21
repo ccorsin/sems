@@ -61,6 +61,9 @@ cargo test --release --test perf -- --ignored --nocapture   # performance
   setpoints, totals, statuses and HTTP codes. After **every step of every scenario** the runner
   checks the safety invariant: no setpoint above its demand or connector, no charger or grid
   overload.
+- **Push** (`tests/push.rs`): a real server on a random port, real WebSocket and HTTP clients.
+  A charger is told its new setpoint when *another* charger's event changes it, and is not
+  disturbed when it does not.
 - **Performance** (`tests/perf.rs`): ignored by default, run in release mode.
 
 ### Scenarios
@@ -115,9 +118,33 @@ All powers are in kW. Errors are `{"error": "<message>"}`.
 | `PUT` | `/sessions/{id}` | `{"demand_kw"}` | `200` | 404 unknown session, 422 |
 | `DELETE` | `/sessions/{id}` | — | `200` | 404 unknown session |
 | `GET` | `/status` | — | `200` | — |
+| `GET` | `/chargers/{id}/setpoints` | — | `200`, or WebSocket upgrade | 404 unknown charger |
 
 Event responses: `{"session_id", "setpoint_kw", "status"}`, where `status` is the full
 station state (a demo convenience: a real charger should only see its own setpoints).
+
+### Setpoints for chargers (push and pull)
+
+`/chargers/{id}/setpoints` is the charger's channel. Opened as a **WebSocket**, it sends the
+current setpoints, then a message **whenever one of them changes** — including when the change
+is caused by another charger's event (a vehicle arriving elsewhere lowers this charger's share).
+A plain **GET** on the same URL returns the same message: a pull fallback while a WebSocket
+reconnects.
+
+```json
+{ "charger": "CP1", "setpoints": [ { "connector": 1, "session_id": "9f1c…", "kw": 200 },
+                                   { "connector": 2, "session_id": null, "kw": 0 } ] }
+```
+
+Try it from a browser console (nothing to install), then post events with `curl`:
+
+```js
+const ws = new WebSocket("ws://localhost:8080/chargers/CP1/setpoints");
+ws.onmessage = (m) => console.log(m.data);
+```
+
+Events still go through the REST routes; messages sent by the charger on the WebSocket are
+ignored (pings are answered). Closing the WebSocket releases nothing (see limitations).
 
 `GET /status` exposes, per station, charger and connector:
 
@@ -154,8 +181,8 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
   before another one has reduced) is addressed in V3 ("decrease before increase").
 - A charger that disappears without ending its session keeps its power reserved (safety first);
   OPS can release it with `DELETE /sessions/{id}`.
-- Other chargers are not notified yet when their setpoint changes: push over WebSocket is the
-  next increment.
+- Setpoint push is fire-and-forget: there is no acknowledgement that a charger applied its new
+  setpoint yet (needed for "decrease before increase", V3).
 
 ## Performance
 
@@ -173,7 +200,7 @@ Linear growth, far below the 1 s budget: end-to-end latency is dominated by the 
 
 | Version | Content |
 |---|---|
-| **V1** (in progress) | REST API ✅, scenarios ✅, Docker ✅; next: WebSocket push of setpoints, `/events` history, metrics and end-to-end performance tests |
+| **V1** (in progress) | REST API ✅, scenarios ✅, Docker ✅, WebSocket push of setpoints ✅; next: `/events` history, metrics and end-to-end performance tests |
 | V2 | Water-filling allocation: no waste, released power goes to the other sessions |
 | V3 | "Decrease before increase" transitions, minimum viable power per session, offline chargers |
 | V4 | Battery storage (BESS): boost, 10% SoC floor, opportunistic charging |

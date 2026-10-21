@@ -1,11 +1,10 @@
 //! Entry point: `sems <config.json>` loads and validates the station configuration,
 //! then serves the HTTP API on port 8080.
 
-use actix_web::{web, App, HttpServer};
 use sems::{api, model::Config, model::Station};
-use std::{env, fs, process::ExitCode, sync::Mutex};
+use std::{env, fs, net::TcpListener, process::ExitCode};
 
-const ADDR: (&str, u16) = ("0.0.0.0", 8080);
+const ADDR: &str = "0.0.0.0:8080";
 
 #[actix_web::main]
 async fn main() -> ExitCode {
@@ -26,18 +25,15 @@ async fn main() -> ExitCode {
 
     let connectors: usize = config.chargers.iter().map(|c| c.connectors.len()).sum();
     println!(
-        "station: grid {} kW, {} chargers, {} connectors — listening on {}:{}",
+        "station: grid {} kW, {} chargers, {} connectors — listening on {ADDR}",
         config.grid_w as f64 / 1000.0,
         config.chargers.len(),
         connectors,
-        ADDR.0,
-        ADDR.1
     );
 
-    let state = web::Data::new(Mutex::new(Station::new(config, api::now_ms())));
-    let server =
-        HttpServer::new(move || App::new().app_data(state.clone()).configure(api::configure));
-    if let Err(e) = async { server.bind(ADDR)?.run().await }.await {
+    let station = Station::new(config, api::now_ms());
+    let result = async { api::serve(station, TcpListener::bind(ADDR)?)?.await }.await;
+    if let Err(e) = result {
         eprintln!("server error: {e}");
         return ExitCode::FAILURE;
     }
