@@ -1,0 +1,10 @@
+{
+  "name": "S08 demand above the connector limit",
+  "why": "The connector level of the cascade: a 150 kW connector caps the vehicle even though its charger could give 300 kW.",
+  "config": { "grid_kw": 400, "chargers": [
+    { "id": "CP1", "max_kw": 300, "connectors": [ { "id": 1, "type": "CCS" }, { "id": 2, "type": "CCS", "max_kw": 150 } ] } ] },
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 2, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 150 }, "unserved_kw": 150 } }
+  ]
+}

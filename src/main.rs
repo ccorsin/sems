@@ -1,11 +1,13 @@
-//! Entry point: `sems <config.json>`.
-//!
-//! Increment 1 only loads and validates the station configuration; the HTTP server comes next.
+//! Entry point: `sems <config.json>` loads and validates the station configuration,
+//! then serves the HTTP API on port 8080.
 
-use sems::model::Config;
-use std::{env, fs, process::ExitCode};
+use sems::{api, model::Config, model::Station};
+use std::{env, fs, net::TcpListener, process::ExitCode};
 
-fn main() -> ExitCode {
+const ADDR: &str = "0.0.0.0:8080";
+
+#[actix_web::main]
+async fn main() -> ExitCode {
     let Some(path) = env::args().nth(1) else {
         eprintln!("usage: sems <config.json>");
         return ExitCode::FAILURE;
@@ -23,10 +25,17 @@ fn main() -> ExitCode {
 
     let connectors: usize = config.chargers.iter().map(|c| c.connectors.len()).sum();
     println!(
-        "station: grid {} kW, {} chargers, {} connectors",
+        "station: grid {} kW, {} chargers, {} connectors — listening on {ADDR}",
         config.grid_w as f64 / 1000.0,
         config.chargers.len(),
-        connectors
+        connectors,
     );
+
+    let station = Station::new(config, api::now_ms());
+    let result = async { api::serve(station, TcpListener::bind(ADDR)?)?.await }.await;
+    if let Err(e) = result {
+        eprintln!("server error: {e}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }

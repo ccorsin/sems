@@ -1,0 +1,10 @@
+{
+  "name": "S14 zero demand takes no share",
+  "why": "A full vehicle still plugged in (0 kW) must not block power: the other vehicle gets its whole demand, up to its charger limit.",
+  "config": "config/station.json",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 }, "expect": { "setpoints": { "A": 200, "B": 200 } } },
+    { "change": { "session": "A", "demand_kw": 0 }, "expect": { "setpoints": { "A": 0, "B": 300 }, "allocated_kw": 300 } }
+  ]
+}

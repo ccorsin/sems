@@ -1,0 +1,14 @@
+{
+  "name": "S15 plugged in but not charging",
+  "why": "OPS must see a vehicle that stays plugged in without charging: status goes charging -> suspended_ev -> charging, and its charger neighbour gets the power meanwhile.",
+  "config": "config/station.json",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 } },
+    { "connect": { "as": "B", "charger": "CP1", "connector": 2, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 150, "B": 150 }, "statuses": { "A": "charging", "B": "charging" } } },
+    { "change": { "session": "A", "demand_kw": 0 },
+      "expect": { "setpoints": { "A": 0, "B": 300 }, "statuses": { "A": "suspended_ev", "B": "charging" } } },
+    { "change": { "session": "A", "demand_kw": 120 },
+      "expect": { "setpoints": { "A": 120, "B": 150 }, "statuses": { "A": "charging" } } }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "S11 invalid events",
+  "why": "API robustness: busy or unknown connector, negative demand and unknown session are rejected with clear codes, and a rejected event leaves the state untouched.",
+  "config": "config/station.json",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 100 }, "expect": { "setpoints": { "A": 100 } } },
+    { "connect": { "as": "X", "charger": "CP1", "connector": 1, "demand_kw": 100 }, "expect": { "http": 409 } },
+    { "connect": { "as": "X", "charger": "CP9", "connector": 1, "demand_kw": 100 }, "expect": { "http": 404 } },
+    { "connect": { "as": "X", "charger": "CP1", "connector": 9, "demand_kw": 100 }, "expect": { "http": 404 } },
+    { "connect": { "as": "X", "charger": "CP1", "connector": 2, "demand_kw": -5 }, "expect": { "http": 422 } },
+    { "change": { "session": "A", "demand_kw": -1 }, "expect": { "http": 422 } },
+    { "change": { "session": "ghost", "demand_kw": 10 }, "expect": { "http": 404 } },
+    { "disconnect": "ghost", "expect": { "http": 404, "setpoints": { "A": 100 }, "allocated_kw": 100 } }
+  ]
+}

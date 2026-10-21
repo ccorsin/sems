@@ -1,0 +1,8 @@
+{
+  "name": "S01 empty station",
+  "why": "Trivial but explicit: with no vehicle, nothing is allocated and the whole grid is available.",
+  "config": "config/station.json",
+  "steps": [
+    { "expect": { "allocated_kw": 0, "available_kw": 400, "unserved_kw": 0 } }
+  ]
+}

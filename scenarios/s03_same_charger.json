@@ -1,0 +1,10 @@
+{
+  "name": "S03 two vehicles on the same charger",
+  "why": "Local contention: both share their charger's 300 kW although the grid still has 100 kW of headroom.",
+  "config": "config/station.json",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 }, "expect": { "setpoints": { "A": 300 } } },
+    { "connect": { "as": "B", "charger": "CP1", "connector": 2, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 150, "B": 150 }, "allocated_kw": 300, "available_kw": 100, "unserved_kw": 300 } }
+  ]
+}

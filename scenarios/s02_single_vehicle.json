@@ -1,0 +1,10 @@
+{
+  "name": "S02 single vehicle",
+  "why": "A vehicle alone takes all it wants, within its charger limit (300 kW < 350 kW requested).",
+  "config": "config/station.json",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 350 },
+      "expect": { "http": 201, "setpoints": { "A": 300 }, "statuses": { "A": "charging" },
+                  "allocated_kw": 300, "available_kw": 100, "unserved_kw": 50 } }
+  ]
+}

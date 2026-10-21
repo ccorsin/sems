@@ -1,4 +1,5 @@
-//! Station model: static configuration, live sessions, and the events that change them.
+//! Station model: static configuration, live sessions, the events that change them, and the
+//! history of those events.
 //!
 //! Power is held in integer watts so that rounding can never push a sum above a limit;
 //! conversion from kW happens at the edges (config parsing, API).
@@ -6,15 +7,21 @@
 //! follows the same path.
 
 use crate::allocator::{allocate, Demand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use uuid::Uuid;
 
 /// Power in watts.
 pub type Watts = u64;
 
-/// Converts a kW value from the outside world to watts. `None` if negative or not finite.
+/// Largest power accepted from the outside world (1 GW). No site or vehicle comes close, and it
+/// keeps every sum of powers far from `u64` overflow (that would take 18 million sessions).
+pub const MAX_KW: f64 = 1_000_000.0;
+
+/// Converts a kW value from the outside world to watts.
+/// `None` if negative, not finite or above [`MAX_KW`] (never silently saturated).
 pub fn kw_to_w(kw: f64) -> Option<Watts> {
-    (kw.is_finite() && kw >= 0.0).then(|| (kw * 1000.0).round() as Watts)
+    (kw.is_finite() && (0.0..=MAX_KW).contains(&kw)).then(|| (kw * 1000.0).round() as Watts)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -140,7 +147,8 @@ pub struct Session {
 
 /// Connector status, derived from its session (names borrowed from OCPP).
 /// Tells OPS whether a plugged-in vehicle is idle because of itself or because of the station.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     /// No vehicle.
     Available,
@@ -180,12 +188,56 @@ pub enum EventError {
     UnknownSession,
 }
 
-/// The whole station: static config plus the live state of every connector.
+/// Kind of an accepted event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    SessionStarted,
+    DemandChanged,
+    SessionEnded,
+}
+
+/// History entry: an accepted event and the allocation that resulted from it.
+/// Lets OPS explain a setpoint afterwards and audit that no limit was ever exceeded.
+#[derive(Debug, Clone)]
+pub struct Record {
+    /// Increases by one per accepted event and never restarts, even when old entries are
+    /// dropped: a reader can detect what it missed.
+    pub seq: u64,
+    pub at_ms: u64,
+    pub kind: EventKind,
+    pub session_id: Uuid,
+    /// Charger and connector indices, in config order.
+    pub charger: usize,
+    pub connector: usize,
+    /// The session's demand after the event (its last demand for `SessionEnded`).
+    pub demand_w: Watts,
+    /// Setpoint of every active session right after the event.
+    pub setpoints: Vec<(Uuid, Watts)>,
+}
+
+/// Number of history entries kept: memory stays bounded, the oldest entries are dropped.
+pub const HISTORY_CAP: usize = 10_000;
+
+/// What an accepted event is about; `apply` completes it into a [`Record`].
+struct Event {
+    kind: EventKind,
+    session_id: Uuid,
+    charger: usize,
+    connector: usize,
+    demand_w: Watts,
+}
+
+/// The whole station: static config, live state of every connector, recent history.
 #[derive(Debug)]
 pub struct Station {
     pub config: Config,
     /// `slots[c][k]` is connector `k` of charger `c`, in config order.
     pub slots: Vec<Vec<Slot>>,
+    /// Latest accepted events, oldest first (at most `history_cap`).
+    pub history: VecDeque<Record>,
+    history_cap: usize,
+    last_seq: u64,
 }
 
 impl Station {
@@ -204,7 +256,13 @@ impl Station {
                     .collect()
             })
             .collect();
-        Station { config, slots }
+        Station {
+            config,
+            slots,
+            history: VecDeque::new(),
+            history_cap: HISTORY_CAP,
+            last_seq: 0,
+        }
     }
 
     /// A vehicle plugs in. Returns the new session id.
@@ -222,7 +280,14 @@ impl Station {
             return Err(EventError::ConnectorBusy);
         }
         let id = Uuid::new_v4();
-        self.apply(now_ms, |s| {
+        let event = Event {
+            kind: EventKind::SessionStarted,
+            session_id: id,
+            charger: c,
+            connector: k,
+            demand_w,
+        };
+        self.apply(now_ms, event, |s| {
             s.slots[c][k].session = Some(Session {
                 id,
                 demand_w,
@@ -241,7 +306,14 @@ impl Station {
         now_ms: u64,
     ) -> Result<(), EventError> {
         let (c, k) = self.find_session(id).ok_or(EventError::UnknownSession)?;
-        self.apply(now_ms, |s| {
+        let event = Event {
+            kind: EventKind::DemandChanged,
+            session_id: id,
+            charger: c,
+            connector: k,
+            demand_w,
+        };
+        self.apply(now_ms, event, |s| {
             if let Some(session) = s.slots[c][k].session.as_mut() {
                 session.demand_w = demand_w;
             }
@@ -252,7 +324,14 @@ impl Station {
     /// The vehicle unplugs: its connector becomes available.
     pub fn disconnect(&mut self, id: Uuid, now_ms: u64) -> Result<(), EventError> {
         let (c, k) = self.find_session(id).ok_or(EventError::UnknownSession)?;
-        self.apply(now_ms, |s| s.slots[c][k].session = None);
+        let event = Event {
+            kind: EventKind::SessionEnded,
+            session_id: id,
+            charger: c,
+            connector: k,
+            demand_w: self.slots[c][k].session.as_ref().map_or(0, |s| s.demand_w),
+        };
+        self.apply(now_ms, event, |s| s.slots[c][k].session = None);
         Ok(())
     }
 
@@ -280,8 +359,10 @@ impl Station {
             .map(|(c, k, _)| (c, k))
     }
 
-    /// Applies a mutation, recomputes every setpoint, and stamps connectors whose status changed.
-    fn apply(&mut self, now_ms: u64, mutate: impl FnOnce(&mut Self)) {
+    /// The single path of every accepted event: applies the mutation, recomputes every
+    /// setpoint, stamps connectors whose status changed, and records the event with the
+    /// resulting allocation. Rejected events never get here, so they are never recorded.
+    fn apply(&mut self, now_ms: u64, event: Event, mutate: impl FnOnce(&mut Self)) {
         let before: Vec<Status> = self.slots.iter().flatten().map(Slot::status).collect();
         mutate(self);
         self.reallocate();
@@ -290,6 +371,25 @@ impl Station {
                 slot.status_since_ms = now_ms;
             }
         }
+
+        if self.history.len() == self.history_cap {
+            self.history.pop_front();
+        }
+        self.last_seq += 1;
+        let setpoints = self
+            .sessions()
+            .map(|(_, _, s)| (s.id, s.setpoint_w))
+            .collect();
+        self.history.push_back(Record {
+            seq: self.last_seq,
+            at_ms: now_ms,
+            kind: event.kind,
+            session_id: event.session_id,
+            charger: event.charger,
+            connector: event.connector,
+            demand_w: event.demand_w,
+            setpoints,
+        });
     }
 
     fn reallocate(&mut self) {
@@ -336,6 +436,9 @@ mod tests {
         assert_eq!(kw_to_w(0.0), Some(0));
         assert_eq!(kw_to_w(-1.0), None);
         assert_eq!(kw_to_w(f64::NAN), None);
+        assert_eq!(kw_to_w(MAX_KW), Some(1_000_000_000));
+        // Regression: 1e20 kW used to saturate to u64::MAX, then overflow when summed.
+        assert_eq!(kw_to_w(1e20), None);
     }
 
     #[test]
@@ -464,5 +567,55 @@ mod tests {
             Err(EventError::UnknownSession),
             "already ended"
         );
+    }
+
+    #[test]
+    fn history_records_accepted_events_with_their_result() {
+        let mut st = station();
+        let a = st.connect("CP2", 1, 300 * KW, 10).unwrap();
+        let b = st.connect("CP2", 2, 300 * KW, 20).unwrap();
+        st.change_demand(a, 100 * KW, 30).unwrap();
+        st.disconnect(b, 40).unwrap();
+        assert!(
+            st.connect("CP2", 1, KW, 50).is_err(),
+            "rejected: not recorded"
+        );
+
+        let h: Vec<&Record> = st.history.iter().collect();
+        assert_eq!(h.len(), 4);
+        assert_eq!(h.iter().map(|r| r.seq).collect::<Vec<_>>(), [1, 2, 3, 4]);
+        assert_eq!(
+            h.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
+            [10, 20, 30, 40]
+        );
+
+        // B's arrival: both sessions share CP2.
+        assert_eq!(h[1].kind, EventKind::SessionStarted);
+        assert_eq!(h[1].setpoints, [(a, 150 * KW), (b, 150 * KW)]);
+
+        // A's demand drops: recorded with its new demand and the resulting split.
+        assert_eq!(h[2].kind, EventKind::DemandChanged);
+        assert_eq!((h[2].session_id, h[2].demand_w), (a, 100 * KW));
+        assert_eq!(h[2].setpoints, [(a, 100 * KW), (b, 150 * KW)]);
+
+        // B leaves: where it was and its last demand are kept; only A remains.
+        assert_eq!(h[3].kind, EventKind::SessionEnded);
+        assert_eq!(
+            (h[3].charger, h[3].connector, h[3].demand_w),
+            (1, 1, 300 * KW)
+        );
+        assert_eq!(h[3].setpoints, [(a, 100 * KW)]);
+    }
+
+    #[test]
+    fn history_keeps_the_latest_entries_when_full() {
+        let mut st = station();
+        st.history_cap = 2;
+        let a = st.connect("CP1", 1, KW, 0).unwrap();
+        st.change_demand(a, 2 * KW, 0).unwrap();
+        st.change_demand(a, 3 * KW, 0).unwrap();
+
+        let seqs: Vec<u64> = st.history.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, [2, 3], "oldest dropped, numbering continues");
     }
 }

@@ -1,0 +1,10 @@
+{
+  "name": "S04 two vehicles on different chargers",
+  "why": "Global contention: each charger could deliver 300 kW, but together they are capped by the 400 kW grid.",
+  "config": "config/station.json",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 }, "expect": { "setpoints": { "A": 300 } } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 200, "B": 200 }, "allocated_kw": 400, "available_kw": 0 } }
+  ]
+}

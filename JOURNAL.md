@@ -53,7 +53,7 @@ the BESS (tracking SoC over time).
 |---|---|---|
 | Language | Rust | — |
 | Dev machine | 2017 MacBook Pro: no `brew` installs, lean dependencies | — |
-| HTTP stack | `axum` + `tokio` + `serde` | `tiny_http` (lighter but less standard); std only (too much hand-written code). **Measured**: 87 crates, 49 s first build, ~1 s incremental, 839 KB release binary. Acceptable. |
+| HTTP stack | `actix-web` (default features off, `macros` only) + `actix-ws` + `serde` — *revised before increment 2, initially `axum`* | `axum`: equivalent for our needs and lighter to build, but the developer already masters actix-web, and "understand every line" matters more than build time at equal runtime performance. `tiny_http` (less standard); std only (too much hand-written code). **Measured** on the dev machine (first debug build / incremental / release build / release binary): axum + ws 87 crates, 49 s / 1 s / 53 s / 0.8 MB; actix-web default features 187 crates, 96 s / 2.2 s / 140 s / 4.8 MB; **actix-web without default features** (no compression, cookies, HTTP/2) **155 crates, 59 s / 1.5 s / 77 s / 2.2 MB**. Acceptable. |
 | Triggers | HTTP REST requests as input | OCPP/WebSocket, MQTT, Modbus, gRPC: realistic but oversized for the assignment. Cited as targets in the README. |
 | Setpoints to chargers | **WebSocket push** from V1 (hybrid: REST in, WS out) | Pull (latency depends on the polling interval); SSE (one-way, further from OCPP); full WebSocket à la OCPP (cannot be tested with `curl`); webhook, gRPC, MQTT (too heavy). |
 | State | In memory: immutable `Arc<Config>` + `Mutex<State>` | `RwLock` (negligible gain); `tokio::Mutex` (useless without `.await` under the lock); actor (more code, possible migration if the BESS requires it); `ArcSwap`, Redis (oversized). A **single** lock, because the "Σ ≤ grid" invariant is global. |
@@ -162,7 +162,7 @@ Three levels, plus performance:
 |---|---|---|
 | Unit | The pure allocation algorithm | `#[test]` in `allocator.rs` |
 | Scenarios | End-to-end behaviour through the API: event sequences → expected state | Declarative JSON files in `scenarios/`, replayed by a Rust runner against the in-process router |
-| Push | WebSocket clients receive new setpoints | Rust tests with `tokio-tungstenite` (dev-dependency) |
+| Push | WebSocket clients receive new setpoints | Rust tests with `awc` (dev-dependency, see increment 4) |
 | Performance | Latency, burst throughput, algorithm scaling | `tests/perf.rs`, `#[ignore]`, run with `cargo test --release -- --ignored` |
 
 **Scenario format (option B)**, chosen over Rust-only tests (less readable for a non-Rust
@@ -223,8 +223,8 @@ The safety invariant is not a scenario: it is checked automatically at every ste
 | P2 | Burst: thousands of concurrent demand changes | No degradation under load, no lock contention, invariant holds |
 | P3 | Algorithm scaling: 4, 100, 10,000 sessions | Computation in µs, linear growth |
 
-- A real server on a random local port; requests sent with `reqwest` (no default features,
-  dev-dependency only, never in the shipped binary).
+- A real server on a random local port; requests sent with `awc` (no default features,
+  dev-dependency only, never in the shipped binary; initially `reqwest`, see increment 4).
 - Assertion: `max < 1 s` (the requirement). Actual figures are printed and reported in the README
   (measured natively on a 2017 MacBook Pro; inside Docker on macOS a VM adds latency, so the
   measurement context is always stated). No tight threshold, to avoid flaky tests on slow machines.
@@ -369,8 +369,10 @@ sequence of `allocated_kw`), and safety audit (`allocated_kw ≤ grid_kw` on eve
 
 ### Push (server → chargers)
 
-**`GET /ws/chargers/{id}`** (WebSocket): on connection, the server sends the current setpoints,
-then one message whenever a setpoint of that charger changes.
+**`GET /chargers/{id}/setpoints`** — *revised in increment 4, initially `/ws/chargers/{id}`*:
+with a WebSocket upgrade, the server sends the current setpoints, then one message whenever a
+setpoint of that charger changes; as a plain GET, it returns the current setpoints (pull
+fallback). Every connector is listed, free ones at 0 kW with `session_id: null`.
 
 ```json
 { "charger": "CP1", "setpoints": [ { "connector": 1, "session_id": "9f1c…", "kw": 150 } ] }
@@ -386,10 +388,11 @@ src/
 └─ api.rs        # HTTP and WebSocket routes
 ```
 
-- `Arc<Config>` (immutable) + `Mutex<State>` (sessions, history) + one `tokio::sync::watch`
+- `web::Data<Mutex<Station>>` (config + sessions, see increment 1) + one `tokio::sync::watch`
   channel per charger for push.
 - No I/O under the lock.
-- Dependencies: `axum` (`ws` feature), `tokio`, `serde`, `serde_json`, `uuid`.
+- Dependencies: `actix-web` (default features off), `actix-ws`, `serde`, `serde_json`, `uuid`.
+  In-memory API tests use `actix_web::test` (no extra dependency).
 
 ---
 
@@ -424,3 +427,276 @@ cargo run -- config/station.json   # station: grid 400 kW, 2 chargers, 4 connect
   mutation, reallocates, and stamps `status_since_ms` only where the derived status changed.
 - **Sessions are found by linear scan**: a station has a handful of connectors; a map
   `id → slot` would add a structure to keep in sync for no measurable gain.
+
+---
+
+## Step 2 — V1, increment 2: REST API, scenarios, allocator performance (2026-10-21)
+
+**Scope**: `src/api.rs` (routes, kW ↔ W conversion, error mapping, `/status`), `src/main.rs`
+(serves on `0.0.0.0:8080`), `tests/scenarios.rs` (runner), `scenarios/s01…s15.json`,
+`tests/perf.rs` (P3, brought forward from increment 6 since the allocator is pure).
+
+**Result**: 17 unit tests + 15 scenarios pass, `clippy` clean. The runner was checked against a
+deliberately wrong expectation (S03 expecting 151 kW): it reports
+`FAIL S03 …: step 2: setpoint of A: expected 151, got 150`. A `curl` smoke test against the real
+server confirmed the routes, the 409 error body, the `suspended_ev` status and the stdout log.
+
+```
+cargo test                                               # unit tests + scenarios
+cargo test --test scenarios -- --nocapture               # one line per scenario
+cargo test --release --test perf -- --ignored --nocapture
+```
+
+**P3 — allocator scaling** (release build, 2017 MacBook Pro, 1,000 runs each):
+
+| Sessions | p50 | p99 | max |
+|---|---|---|---|
+| 4 | 0.36 µs | 0.38 µs | 1.4 µs |
+| 100 | 2.7 µs | 5.1 µs | 36.4 µs |
+| 10,000 | 236 µs | 365 µs | 432 µs |
+
+Linear growth. Even a 10,000-session station uses under 0.05% of the 1 s budget for the
+computation: latency will be dominated by the network, as expected.
+
+**Implementation choices and deviations from the specs**
+
+- **Uniform JSON errors**: malformed bodies, missing fields and wrong types go through a custom
+  `JsonConfig` error handler (422); an invalid UUID in the URL is a 404 "unknown session". Both
+  are covered by a unit test in `api.rs`, since the scenario runner only sends well-formed requests.
+- **Log line simplified**: `session_started session=<id> setpoint=300.0kW station_allocated=300.0kW`
+  (no charger/connector, which is gone after a disconnect). Built under the lock, printed after.
+  *Revised in increment 4*: log values are rounded to 0.1 kW for readability (`166.7kW` instead
+  of `166.666kW`); the API keeps watt precision, and auditing relies on the API, not the logs.
+- **Runner checks `GET /status` after every step** (rather than the event response), so error
+  steps and observation-only steps are checked the same way.
+- **Scenario format details**: `config` is either inline or a path (`"config/station.json"`) to
+  avoid repeating the brief's station; a step without event only checks expectations; when
+  `http` is not expected, any 2xx is required (a typo in a scenario cannot pass silently); an
+  unknown alias maps to a random UUID to exercise "unknown session"; all scenarios run even if
+  one fails, and the report lists every failure.
+- **`status_since_ms` not checked by scenarios** (real clock), only status changes; exact values
+  are covered by the model's unit tests with a controlled clock.
+
+---
+
+## Step 3 — V1, increment 3: Docker and minimal README (2026-10-21)
+
+**Scope**: `Dockerfile` (multi-stage), `docker-compose.yml`, `.dockerignore`, `README.md`.
+**First complete deliverable**: a reviewer with only Docker can run the server and the tests.
+
+```
+docker compose up --build        # server on :8080
+docker compose run --rm test     # unit tests + scenarios
+```
+
+**Result** (Docker Desktop on the 2017 MacBook Pro, 4 CPUs / 8 GB VM):
+
+| | |
+|---|---|
+| First build of both images | 5 min 24 s |
+| Rebuild after a source change | 12 s (dependency layers cached) |
+| Runtime image | 26.7 MB, runs as non-root (uid 65532) |
+| Test image | 1.76 GB (full Rust toolchain, only built for `test`) |
+| Tests in Docker | 17 unit tests + 15 scenarios pass |
+| Smoke test | `curl` against the container: 201, 300 kW then 200/200 kW, log lines visible with `docker compose logs` |
+
+**Choices**
+
+- **Stages**: `base` (dummy crate) → `builder` (release) and `tester` (debug, so the
+  `debug_assert!` invariant is active), → `runtime` (default target). BuildKit only builds the
+  stages a target needs: `docker compose up` never builds the test image.
+- **Dependency caching**: dependencies are compiled against a dummy `main.rs` / `lib.rs` before
+  the sources are copied; `touch` makes cargo rebuild the real crate afterwards.
+- **Runtime image `gcr.io/distroless/cc-debian12:nonroot`** (chosen over `debian:bookworm-slim`):
+  no shell, non-root user, ~27 MB. Debugging goes through logs and the API.
+- **Builder pinned to `rust:1.96-slim-bookworm`**: same compiler as the dev machine, and Debian 12
+  like the runtime (glibc compatibility).
+- **`ENTRYPOINT ["/sems"]` + `CMD ["/config/station.json"]`**: another config path can be passed
+  without redefining the entry point; another station is a mounted file.
+- **Test service behind a compose profile**: `docker compose up` starts the server only.
+- **README is minimal on purpose**: quick start, tests, scenarios, API, key decisions,
+  limitations, performance, roadmap. The full architecture/trade-offs section comes at the end
+  of V1; `JOURNAL.md` holds the detailed reasoning meanwhile.
+
+---
+
+## Step 4 — V1, increment 4: setpoint push over WebSocket (2026-10-21)
+
+**Scope**: `src/api.rs` (route `/chargers/{id}/setpoints`, one `watch` channel per charger,
+`api::serve`), `src/main.rs` (uses `api::serve`), `tests/push.rs`, README (API section).
+
+**Result**: 17 unit tests + 15 scenarios + 3 push tests pass, `clippy` clean. The push tests were
+checked against a deliberate bug (notify every charger on every event): 2 of 3 fail as expected.
+Three consecutive runs pass (no flakiness).
+
+| Push test | Checks |
+|---|---|
+| `other_charger_is_told_without_asking` | Initial snapshot; A on CP1 gets 300 kW; B arrives on CP2 → **CP1 receives A = 200 kW without having sent anything**, CP2 receives B = 200 kW; a plain GET returns what was last pushed |
+| `no_message_when_setpoints_do_not_change` | A (100 kW, below its share) is not disturbed by B's arrival: no message within 200 ms |
+| `unknown_charger_is_404` | JSON 404 on GET, WebSocket handshake refused |
+
+**Decisions**
+
+- **Route `/chargers/{id}/setpoints`** (resource-oriented) chosen over `/ws/chargers/{id}`
+  (transport in the URL) and `/ocpp/{id}` (misleading: we do not speak OCPP). The same URL
+  serves a JSON snapshot on a plain GET and a stream on a WebSocket upgrade, which also gives
+  chargers the missing **pull fallback** for their own setpoints (`/status` is meant for OPS).
+- **`tokio::sync::watch`, one per charger**: it keeps only the latest value, so a slow client
+  never receives a backlog of stale setpoints (a `broadcast` channel would queue them).
+- **Publishing under the lock** with `send_if_modified`: in-memory only, and it guarantees that
+  concurrent events are published in the order they were applied. Only chargers whose
+  setpoints changed are woken up.
+- **Pull reads the channel, not the station lock**: a charger polling its setpoints never
+  contends with event processing.
+- **WebSocket closing releases nothing** (safety first, see assumptions); it is logged
+  (`ws_connected` / `ws_disconnected`), groundwork for the V3 `offline` status.
+- **Test clients: `awc`** (actix's own HTTP + WebSocket client, no default features) and
+  `futures-util` (for `StreamExt::next`, already pulled in by actix-web). Testing push needs a
+  real server and real clients; `actix-ws` is server-side only. A first version used `reqwest` +
+  `tokio-tungstenite`: replaced by `awc`, one client for both protocols, same ecosystem as the
+  server (which the developer knows), and lighter since it reuses `actix-http`: the dev build
+  went from 199 to **165 crates** (154 for the binary alone). `api::serve(station, listener)`
+  was extracted from `main.rs` so tests can start a server on port 0.
+
+---
+
+## Step 5 — V1, increment 5: `/events` history (2026-10-21)
+
+**Scope**: `src/model.rs` (history recorded by `Station::apply`), `src/api.rs` (`GET /events`),
+`tests/scenarios.rs` (history invariant), README (history section).
+
+**Result**: 20 unit tests + 15 scenarios + 3 push tests pass, `clippy` clean. The history
+invariant was checked against a deliberate bug (`seq` incremented by 2): every scenario fails at
+step 1 with `history: expected seq 1, got 2`.
+
+**Decisions**
+
+- **Recorded in the model, inside `Station::apply`**: the single path of every accepted event.
+  No accepted event can be missed, the entry is written after reallocation (so its `result` is
+  the post-event state), and rejected events never reach `apply`, so they are never recorded.
+  Stored in watts with indices; the API converts to kW and ids.
+- **`VecDeque`** (std ring buffer) with a capacity of 10,000: appending and dropping the oldest
+  entry are both O(1). Rejected: `Vec::remove(0)` (shifts every entry on each event, under the
+  lock), an unbounded `Vec` (memory grows forever), a hand-made ring index (re-implements
+  `VecDeque`).
+- **`seq` never restarts**, even when old entries are dropped: a reader detects gaps.
+- **Rejected events are not recorded** (for now): they stay visible in the HTTP response. A
+  documented option if OPS needs to trace refused attempts.
+- **History invariant in the scenario runner**, checked after every step like the safety one:
+  an accepted event adds exactly one entry (expected seq, kind and session) whose
+  `result.allocated_kw` equals `/status`; a rejected event adds none. The 15 existing scenarios
+  thus test the history without any new scenario file.
+- **Query validation**: an invalid `session` (not a UUID) or `limit` returns a JSON 422, like
+  other errors (`QueryConfig` error handler). An unknown session returns an empty list.
+- **`allocated_kw` is not stored**: it is derived from the recorded setpoints when rendering.
+
+---
+
+## Step 6 — V1, increment 6: allocation metrics and end-to-end performance (2026-10-21)
+
+**Scope**: `tests/scenarios.rs` (metrics), `tests/perf.rs` (P1, P2; P3 kept), `tests/common/mod.rs`
+(server/client helpers shared by `push.rs` and `perf.rs`), README (performance and metrics).
+**V1 is complete.**
+
+**Result**: 20 unit tests + 15 scenarios + 3 push tests pass, `clippy` clean. Several metric
+values were checked by hand (waste of S07, S09, S15; fairness of S09; overshoot of S04).
+
+### V1 allocation metrics (baseline for V2)
+
+Worst case over each scenario's steps (churn: average per accepted event).
+
+| Scenario | Waste max (kW) | Efficiency min (%) | Satisfaction min (%) | Fairness min | Churn avg (setpoints/event) | Overshoot max (kW) |
+|---|---|---|---|---|---|---|
+| S01 empty station | 0.0 | 100.0 | 100.0 | 1.00 | 0.0 | 0.0 |
+| S02 single vehicle | 0.0 | 100.0 | 85.7 | 1.00 | 1.0 | 0.0 |
+| S03 two vehicles on the same charger | 0.0 | 100.0 | 50.0 | 1.00 | 1.5 | 50.0 |
+| S04 two vehicles on different chargers | 0.0 | 100.0 | 66.7 | 1.00 | 1.5 | 100.0 |
+| S05 a vehicle leaves | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
+| S06 full station | 0.0 | 100.0 | 33.3 | 1.00 | 2.5 | 100.0 |
+| S07 demand decreases then increases | 100.0 | 71.4 | 66.7 | 0.96 | 1.2 | 100.0 |
+| S08 demand above the connector limit | 0.0 | 100.0 | 50.0 | 1.00 | 1.0 | 0.0 |
+| S09 heterogeneous chargers | 166.7 | 55.2 | 55.2 | 0.91 | 1.7 | 0.0 |
+| S10 V1 known waste | 33.3 | 93.3 | 50.0 | 1.00 | 1.3 | 0.0 |
+| S11 invalid events | 0.0 | 100.0 | 100.0 | 1.00 | 1.0 | 0.0 |
+| S12 demand increase under contention | 100.0 | 71.4 | 66.7 | 0.96 | 1.0 | 0.0 |
+| S13 cascading release | 113.3 | 68.8 | 33.3 | 0.85 | 2.4 | 100.0 |
+| S14 zero demand takes no share | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
+| S15 plugged in but not charging | 30.0 | 90.0 | 50.0 | 0.90 | 1.8 | 50.0 |
+
+**Reading**
+
+- **Safe, but wasteful**: waste reaches 166.7 kW (S09: the share left unused by a 22 kW AC
+  charger is not handed to the 300 kW charger), 113.3 kW in S13, 100 kW in S07/S12. V2 targets
+  0 kW everywhere; the cost to watch is churn (redistributing disturbs more chargers).
+- **Transition risk quantified**: whenever a share moves from one charger to another, a charger
+  ramping up before the other has reduced would overload the grid by up to 100 kW. This is the
+  case for "decrease before increase" (V3), which should bring overshoot to 0.
+- Satisfaction below 100 % is expected when the station is saturated (S06: 4 × 300 kW requested
+  on a 400 kW grid); it is not a defect.
+
+### Performance (release, native, 2017 MacBook Pro, ranges over 3 runs)
+
+| Test | p50 | p99 | max |
+|---|---|---|---|
+| P1 event → push to another charger (200 runs) | 155–171 µs | 282–464 µs | 444–582 µs |
+| P2 request latency, 8 clients × 500 events, 20 sessions | 1.0–1.2 ms | 3.0–3.4 ms | 3.6–6.2 ms |
+| P3 allocation, 4 / 100 / 10,000 sessions (p50) | 0.4–0.6 µs | 2.8 µs | 248–255 µs |
+
+P2 throughput: **5,300–5,900 events/s**, safety invariant checked on all 4,000 responses, all
+events found in `/events`. P1's worst case (< 0.6 ms) is ~1,700 times below the 1 s requirement.
+
+### Decisions
+
+- **Metrics computed by the test runner from `/status`**, not by the server: measurement stays
+  out of the product. Worst case per scenario (like p99/max for latency: for critical
+  infrastructure the worst moment matters), except churn (a recurring cost: average).
+- **Optimum** = `min(grid, Σ chargers min(charger, Σ sessions min(demand, connector)))`: the
+  most power deliverable under the nested limits; V2's water-filling should reach it.
+- **Overshoot is measured at grid level only.** Chargers have the same transition risk (S03:
+  A going 300 → 150 while B goes 0 → 150 could briefly put 450 kW on a 300 kW charger); not
+  measured yet, noted for V3.
+- **P1 toggles B between 0 and 300 kW**: with V1's equal share, only a change in the number of
+  active sessions moves A's setpoint (300 ↔ 200 kW).
+- **Perf tests run with `--test-threads=1`** so that P1, P2 and P3 do not compete for CPU.
+- **Shared helpers in `tests/common/mod.rs`** (start a server, subscribe, connect…), used by
+  `push.rs` and `perf.rs`, instead of duplicating them.
+- **Honesty about the figures**: client and server share the machine (upper bounds), every event
+  response carries the full station state (part of P2's cost), max values vary with OS
+  scheduling (hence ranges).
+
+---
+
+## Step 7 — Critical review of the tests, and a bug fix (2026-10-21)
+
+**Bug found while reviewing the tests** (none of them caught it): two sessions requesting
+`1e20` kW killed the server.
+
+1. `kw_to_w(1e20)` saturated silently to `u64::MAX` (Rust's float → integer cast).
+2. Summing two such demands for `unserved_kw` overflowed: a panic in debug, **under the lock**.
+3. The lock was poisoned and, by design ("fail loudly"), every later request panicked too.
+   In release (the Docker image) the sum wrapped silently instead: no crash, but wrong values.
+
+**Fix**: `kw_to_w` rejects any power above `MAX_KW` = 1,000,000 kW (1 GW) instead of saturating;
+the API answers 422. One bound for every power from the outside world (demands and config):
+no site or vehicle comes close, and it keeps every sum far from `u64` overflow (18 million
+sessions at 1 GW would be needed). Checked against the real server: both requests now get a
+422, the 1 GW limit is accepted, `/status` keeps answering, no panic in the log.
+Rejected: a 10 MW cap on demands plus saturating additions (two mechanisms where one bound at
+the edge suffices). Regression: unit test on `kw_to_w` and scenario S16.
+
+**Review of the test suite — remaining weaknesses** (documented, not all addressed):
+
+| # | Weakness | Decision |
+|---|---|---|
+| 1 | Only hand-written scenarios: we test what we imagined (this is how the bug slipped through) | Randomized property test (seeded generator, shadow model predicting HTTP codes, invariants at every step): **postponed to V2**, where it also checks "waste = 0" |
+| 2 | Expected values computed by the author of the algorithm (shared misunderstanding possible) | Mitigated by algorithm-independent invariants; V2's optimum acts as an oracle |
+| 3 | A panic under the lock takes the whole service down | To be discussed |
+| 4 | Time-based assertions ("no message within 200 ms", "< 1 s") can pass or fail by timing | Accepted for now (3/3 green runs) |
+| 5 | Order of pushed messages under concurrency not tested | Later, with the WebSocket work |
+| 6 | WebSocket edge cases (close, many clients, reconnection) not tested | Later, with the WebSocket work |
+| 7 | Overshoot measured at grid level only; runtime Docker image only smoke-tested by hand | Noted |
+| 8 | Mutation testing done by hand, case by case | Accepted |
+
+Strengths kept: two invariants checked at every step independently of expected values, a
+mandatory `why` per scenario, real server and clients for push and performance, tests verified
+against deliberate bugs.
