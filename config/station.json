@@ -1,0 +1,7 @@
+{
+  "grid_kw": 400,
+  "chargers": [
+    { "id": "CP1", "max_kw": 300, "connectors": [ { "id": 1, "type": "CCS" }, { "id": 2, "type": "CCS" } ] },
+    { "id": "CP2", "max_kw": 300, "connectors": [ { "id": 1, "type": "CCS" }, { "id": 2, "type": "CCS" } ] }
+  ]
+}
