@@ -217,19 +217,7 @@ reviewer), `curl` scripts (no assertions) and Hurl (an extra tool, no WebSocket 
 reconsidered later). Server-generated UUIDs are referenced through aliases (`"as": "A"`). The
 `why` field is mandatory.
 
-```json
-{
-  "name": "two_vehicles_same_charger",
-  "why": "Local contention: two sessions on one charger share its 300 kW even though the grid has headroom.",
-  "config": { "grid_kw": 400, "chargers": [ { "id": "CP1", "max_kw": 300, "connectors": [ {"id": 1}, {"id": 2} ] },
-                                            { "id": "CP2", "max_kw": 300, "connectors": [ {"id": 1}, {"id": 2} ] } ] },
-  "steps": [
-    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 }, "expect": { "A": 300 } },
-    { "connect": { "as": "B", "charger": "CP1", "connector": 2, "demand_kw": 300 }, "expect": { "A": 150, "B": 150, "allocated_kw": 300 } },
-    { "disconnect": "A", "expect": { "B": 300 } }
-  ]
-}
-```
+The final format is documented in the README ("Scenarios").
 
 In V1, behaviour depends only on the **order** of events, not on their timing. A simulated clock
 (`"advance_time"` step) will be added with the BESS (V4), where SoC evolves over time.
@@ -313,133 +301,11 @@ optimum = min( grid, Σ_chargers min( charger_max, Σ_sessions min(demand, conne
 
 ## V1 specifications
 
-### Running
-
-```
-sems <path/config.json>          # listens on 0.0.0.0:8080
-docker run -p <port>:8080 -v ./config:/config sems /config/station.json
-```
-
-The config is **validated at startup**. On error, the server prints a clear message and exits.
-Detected errors: duplicate IDs, power ≤ 0, connector more powerful than its charger, charger
-without connectors.
-
-### Configuration
-
-```json
-{
-  "grid_kw": 400,
-  "chargers": [
-    { "id": "CP1", "max_kw": 300,
-      "connectors": [ { "id": 1, "type": "CCS" }, { "id": 2, "type": "CCS", "max_kw": 150 } ] }
-  ]
-}
-```
-
-- `connectors[].max_kw` is optional; it defaults to the charger's `max_kw`.
-- `type` is informational and has no effect on allocation.
-
-### Exposed quantities
-
-| Field | Level | Meaning |
-|---|---|---|
-| `demand_kw` | session | What the vehicle requests (input) |
-| `setpoint_kw` | session | What the system allows (output), always ≤ `demand_kw` |
-| `allocated_kw` | charger, station | Sum of setpoints |
-| `available_kw` | station | `grid_kw − allocated_kw` (grid headroom, not necessarily usable: a charger may be saturated) |
-| `unserved_kw` | charger, station | `Σ (demand − setpoint)`: unmet demand. OPS diagnostics. |
-
-### Events (chargers → server)
-
-| Method | Route | Body | Success | Errors |
-|---|---|---|---|---|
-| `POST` | `/sessions` | `{"charger": "CP1", "connector": 1, "demand_kw": 150}` | `201` + response below | 404 unknown charger/connector, 409 connector busy, 422 invalid demand (< 0) |
-| `PUT` | `/sessions/{id}` | `{"demand_kw": 80}` | `200` + response below | 404, 422 |
-| `DELETE` | `/sessions/{id}` | — | `200` + response below | 404 |
-
-Response: `{"session_id": "…", "setpoint_kw": 150, "status": { /* full state, see GET /status */ }}`.
-Returning the full station state to a charger is a **convenience for the demo and tests**: in a
-real system a charger should only see its own setpoints. Documented as such.
-
-A demand of 0 kW is valid (vehicle full but still plugged in). Errors have the form
-`{"error": "human-readable message"}`.
-
-The WebSocket push and the HTTP response travel on two channels, so their arrival order is not
-guaranteed; both carry the same values.
-
-### Queries (OPS)
-
-**`GET /status`** (also embedded as `status` in every event response):
-
-```json
-{ "grid_kw": 400, "allocated_kw": 300, "available_kw": 100, "unserved_kw": 300,
-  "chargers": [
-    { "id": "CP1", "max_kw": 300, "allocated_kw": 300, "unserved_kw": 300,
-      "connectors": [
-        { "id": 1, "type": "CCS", "max_kw": 300,
-          "status": "charging", "status_since_ms": 1761040000000,
-          "session": { "id": "9f1c…", "started_at_ms": 1761040000000,
-                       "demand_kw": 300, "setpoint_kw": 150 } },
-        { "id": 2, "type": "CCS", "max_kw": 150,
-          "status": "available", "status_since_ms": 1761039000000, "session": null } ] } ] }
-```
-
-**Connector status** (names borrowed from OCPP). It tells OPS *why* a plugged-in vehicle is not
-charging: the vehicle does not ask for anything, or the station cannot give it anything.
-
-| `status` | Condition | Meaning for OPS | Version |
-|---|---|---|---|
-| `available` | no session | Free | V1 |
-| `charging` | setpoint > 0 | Charging | V1 |
-| `suspended_ev` | demand = 0 | Plugged in, the **vehicle** no longer requests power (battery full): candidate for idle fees | V1 |
-| `suspended_evse` | demand > 0, setpoint = 0 | Plugged in, the **station** cannot give it power | V3 (minimum power) |
-
-- The status is **derived** from demand and setpoint, never stored, so it cannot be inconsistent.
-- `status_since_ms` is the time of the last status change ("plugged in without charging for
-  45 min" is what OPS needs). Only that timestamp is stored.
-- Ended sessions are available in the history.
-
-**`GET /events?limit=100&session=<uuid>`**: the server keeps the last 10,000 events. `limit`
-defaults to 100; `session` is an optional filter. Each entry holds **the event and the resulting
-allocation**:
-
-```json
-{ "seq": 7, "at_ms": 1761040000000, "kind": "demand_changed",
-  "session_id": "9f1c…", "charger": "CP1", "connector": 1, "demand_kw": 80,
-  "result": { "allocated_kw": 230, "setpoints": [ { "session_id": "9f1c…", "kw": 80 } ] } }
-```
-
-`kind` values: `session_started`, `demand_changed`, `session_ended`.
-
-This format covers the OPS needs: per-session history (`?session=`), station history (the
-sequence of `allocated_kw`), and safety audit (`allocated_kw ≤ grid_kw` on every entry).
-
-### Push (server → chargers)
-
-**`GET /chargers/{id}/setpoints`** — *revised in increment 4, initially `/ws/chargers/{id}`*:
-with a WebSocket upgrade, the server sends the current setpoints, then one message whenever a
-setpoint of that charger changes; as a plain GET, it returns the current setpoints (pull
-fallback). Every connector is listed, free ones at 0 kW with `session_id: null`.
-
-```json
-{ "charger": "CP1", "setpoints": [ { "connector": 1, "session_id": "9f1c…", "kw": 150 } ] }
-```
-
-### Internal architecture
-
-```
-src/
-├─ main.rs       # startup: read config, start server
-├─ model.rs      # config, sessions, state (pure)
-├─ allocator.rs  # allocation algorithm (pure, no I/O)
-└─ api.rs        # HTTP and WebSocket routes
-```
-
-- `web::Data<Mutex<Station>>` (config + sessions, see increment 1) + one `tokio::sync::watch`
-  channel per charger for push.
-- No I/O under the lock.
-- Dependencies: `actix-web` (default features off), `actix-ws`, `serde`, `serde_json`, `uuid`.
-  In-memory API tests use `actix_web::test` (no extra dependency).
+Agreed before any code: routes, payloads, error codes, the `/status` and `/events` formats, the
+connector statuses (`available`, `charging`, `suspended_ev`, `suspended_evse`, derived from
+demand and setpoint, never stored) and the module layout (`model`, `allocator`, `api`, `main`).
+They are documented, as they stand today, in the README; deviations are recorded in the steps
+below.
 
 ---
 
@@ -961,7 +827,6 @@ fields).
   the sketched rule. It cannot be a scenario since the feature does not exist; not needed for
   the brief's station.
 
-
 ---
 
 # V4 — Battery storage (BESS)
@@ -1048,6 +913,7 @@ simulated chargers that acknowledge on reception. Typical cost about 2 ms; worst
 A first version failed intermittently: each helper call opened a new HTTP connection, and the
 thousands of connections left in TIME_WAIT exhausted the laptop's TCP ports. P4 now shares one
 client (connection reuse). A test-side fix; the server was not involved.
+
 - Added a **full-station case** (3 → 4 sessions, both chargers decrease and must acknowledge before
   the fourth vehicle gets 100 kW) and an "active sessions" column: median about 2 ms, worst case
   377 ms observed.
@@ -1075,18 +941,3 @@ configuration" README section (format, defaults, validation, examples), a second
 `docker-compose.yml` to start any station. Checked in the container: both examples start, an
 invalid file is refused at startup with its message. Also a table of contents at the top of the
 README.
-
-## Step 24 — README checked against the running server; performance measured in Docker (2026-10-21)
-
-Every `curl` of the quick start was replayed against the container: all correct. Added the server
-logs of that sequence (they tell the barrier's story line by line), an abridged real `/status`
-response, the BESS block and why its `soc` is `null` until the BMS reports one, and made explicit
-that `/events` without `session` returns the whole station's history (in memory, empty after a
-restart).
-
-Performance figures are now measured inside the Docker container, the command any reviewer can
-run, instead of natively on the dev machine. Throughput is lower (P2 2,850–3,600 events/s, the
-Docker Desktop VM's cost), latency tails are much tighter (P4 worst case 31 ms instead of 377 ms, over 3 runs):
-every cascade stays far below 1 s. Pitfall found on the way: `docker compose run` reuses the last
-built image, so the first measurement ran stale code; the README now starts with
-`docker compose build test` (`run --build` needs Compose ≥ 2.13).
