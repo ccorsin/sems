@@ -14,7 +14,7 @@
 //! then written after it is released. Publishing to the `watch` channels is in-memory and done
 //! under the lock, so concurrent events are published in the order they were applied.
 
-use crate::model::{kw_to_w, EventError, Station, Status, Watts};
+use crate::model::{kw_to_w, EventError, EventKind, Record, Station, Status, Watts};
 use actix_web::{
     dev::Server, error::InternalError, http::header, http::StatusCode, web, App, HttpRequest,
     HttpResponse, HttpServer,
@@ -59,15 +59,20 @@ pub fn serve(station: Station, listener: TcpListener) -> std::io::Result<Server>
 
 /// Registers the routes. The caller provides the [`AppState`] through `App::app_data`.
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    // Malformed or incomplete JSON bodies get the same `{"error": …}` shape as other errors.
+    // Malformed bodies or query strings get the same `{"error": …}` shape as other errors.
     let json = web::JsonConfig::default().error_handler(|err, _| {
         InternalError::from_response("", error(StatusCode::UNPROCESSABLE_ENTITY, err)).into()
     });
+    let query = web::QueryConfig::default().error_handler(|err, _| {
+        InternalError::from_response("", error(StatusCode::UNPROCESSABLE_ENTITY, err)).into()
+    });
     cfg.app_data(json)
+        .app_data(query)
         .route("/sessions", web::post().to(start_session))
         .route("/sessions/{id}", web::put().to(change_demand))
         .route("/sessions/{id}", web::delete().to(end_session))
         .route("/status", web::get().to(status))
+        .route("/events", web::get().to(events))
         .route("/chargers/{id}/setpoints", web::get().to(setpoints));
 }
 
@@ -126,6 +131,33 @@ async fn end_session(state: AppState, id: web::Path<String>) -> HttpResponse {
     run_event(&state, StatusCode::OK, "session_ended", |st, now| {
         st.disconnect(id, now).map(|()| id)
     })
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    limit: Option<usize>,
+    session: Option<String>,
+}
+
+/// History: the latest `limit` matching events (default 100), oldest first.
+async fn events(state: AppState, query: web::Query<EventsQuery>) -> HttpResponse {
+    let session = match query.session.as_deref().map(Uuid::parse_str) {
+        Some(Err(_)) => return error(StatusCode::UNPROCESSABLE_ENTITY, "session must be a UUID"),
+        parsed => parsed.and_then(Result::ok),
+    };
+    let limit = query.limit.unwrap_or(100);
+    let mut entries: Vec<EventView> = {
+        let st = lock(&state);
+        st.history
+            .iter()
+            .rev()
+            .filter(|r| session.is_none_or(|id| r.session_id == id))
+            .take(limit)
+            .map(|r| EventView::of(&st, r))
+            .collect()
+    };
+    entries.reverse();
+    HttpResponse::Ok().json(entries)
 }
 
 async fn status(state: AppState) -> HttpResponse {
@@ -273,6 +305,57 @@ fn event_error(e: EventError) -> HttpResponse {
 
 fn kw(w: Watts) -> f64 {
     w as f64 / 1000.0
+}
+
+/// History entry: the event, then the allocation that resulted from it.
+#[derive(Serialize)]
+struct EventView {
+    seq: u64,
+    at_ms: u64,
+    kind: EventKind,
+    session_id: Uuid,
+    charger: String,
+    connector: u32,
+    demand_kw: f64,
+    result: ResultView,
+}
+
+#[derive(Serialize)]
+struct ResultView {
+    allocated_kw: f64,
+    setpoints: Vec<SessionSetpoint>,
+}
+
+#[derive(Serialize)]
+struct SessionSetpoint {
+    session_id: Uuid,
+    kw: f64,
+}
+
+impl EventView {
+    fn of(st: &Station, r: &Record) -> Self {
+        let charger = &st.config.chargers[r.charger];
+        EventView {
+            seq: r.seq,
+            at_ms: r.at_ms,
+            kind: r.kind,
+            session_id: r.session_id,
+            charger: charger.id.clone(),
+            connector: charger.connectors[r.connector].id,
+            demand_kw: kw(r.demand_w),
+            result: ResultView {
+                allocated_kw: kw(r.setpoints.iter().map(|(_, w)| w).sum()),
+                setpoints: r
+                    .setpoints
+                    .iter()
+                    .map(|&(session_id, w)| SessionSetpoint {
+                        session_id,
+                        kw: kw(w),
+                    })
+                    .collect(),
+            },
+        }
+    }
 }
 
 /// What a charger receives: the setpoint of each of its connectors (0 kW when free).
@@ -449,6 +532,8 @@ mod tests {
                 404,
             ),
             (test::TestRequest::delete().uri("/sessions/not-a-uuid"), 404),
+            (test::TestRequest::get().uri("/events?session=nope"), 422),
+            (test::TestRequest::get().uri("/events?limit=-1"), 422),
         ];
         for (req, code) in cases {
             let res = test::call_service(&app, req.to_request()).await;
@@ -456,5 +541,38 @@ mod tests {
             let body: serde_json::Value = test::read_body_json(res).await;
             assert!(body["error"].is_string(), "{body}");
         }
+    }
+
+    #[actix_web::test]
+    async fn events_limit_and_session_filter() {
+        let cfg = Config::from_json(
+            r#"{ "grid_kw": 10, "chargers": [ { "id": "A", "max_kw": 10, "connectors": [ { "id": 1 }, { "id": 2 } ] } ] }"#,
+        );
+        let state = Shared::new(Station::new(cfg.unwrap(), 0));
+        let app = test::init_service(App::new().app_data(state).configure(configure)).await;
+        let get = |uri: &str| test::TestRequest::get().uri(uri).to_request();
+        let post = |connector: u32| {
+            test::TestRequest::post()
+                .uri("/sessions")
+                .set_json(json!({ "charger": "A", "connector": connector, "demand_kw": 4 }))
+                .to_request()
+        };
+
+        let a: serde_json::Value = test::call_and_read_body_json(&app, post(1)).await;
+        test::call_service(&app, post(2)).await;
+        let all: Vec<serde_json::Value> = test::call_and_read_body_json(&app, get("/events")).await;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1]["kind"], "session_started");
+        assert_eq!(all[1]["result"]["allocated_kw"], 8.0);
+
+        let last: Vec<serde_json::Value> =
+            test::call_and_read_body_json(&app, get("/events?limit=1")).await;
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0]["seq"], 2, "limit keeps the most recent");
+
+        let uri = format!("/events?session={}", a["session_id"].as_str().unwrap());
+        let only_a: Vec<serde_json::Value> = test::call_and_read_body_json(&app, get(&uri)).await;
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0]["session_id"], a["session_id"]);
     }
 }

@@ -1,8 +1,11 @@
 //! Scenario runner: replays every `scenarios/*.json` file against the API (in memory).
 //!
 //! A scenario is a config plus ordered steps. Each step sends at most one event, then checks
-//! its optional expectations against `GET /status`. After **every** step the safety invariant
-//! is checked too: no setpoint above its demand or connector, no charger or grid overload.
+//! its optional expectations against `GET /status`. After **every** step two invariants are
+//! checked too, without being written in the scenario files:
+//! - safety: no setpoint above its demand or connector, no charger or grid overload;
+//! - history: an accepted event adds exactly one `/events` entry (right kind, right session,
+//!   resulting allocation equal to `/status`); a rejected event adds none.
 //!
 //! Sessions are named by aliases (`"as": "A"`) since the server generates the UUIDs.
 //! An unknown alias maps to a random UUID, to exercise the "unknown session" path.
@@ -123,28 +126,35 @@ async fn run(scenario: &Scenario) -> Result<(), String> {
         sessions.get(alias).map_or_else(Uuid::new_v4, |s| s.0)
     };
 
+    let mut last_seq = 0;
     for (i, step) in scenario.steps.iter().enumerate() {
         let at = |e: String| format!("step {}: {e}", i + 1);
 
+        // The request, and the history `kind` it produces if accepted.
         let request = match (&step.connect, &step.change, &step.disconnect) {
-            (Some(c), None, None) => {
-                Some(test::TestRequest::post().uri("/sessions").set_json(json!({
+            (Some(c), None, None) => Some((
+                test::TestRequest::post().uri("/sessions").set_json(json!({
                     "charger": c.charger, "connector": c.connector, "demand_kw": c.demand_kw
-                })))
-            }
-            (None, Some(c), None) => Some(
+                })),
+                "session_started",
+            )),
+            (None, Some(c), None) => Some((
                 test::TestRequest::put()
                     .uri(&format!("/sessions/{}", id_of(&sessions, &c.session)))
                     .set_json(json!({ "demand_kw": c.demand_kw })),
-            ),
-            (None, None, Some(alias)) => Some(
+                "demand_changed",
+            )),
+            (None, None, Some(alias)) => Some((
                 test::TestRequest::delete().uri(&format!("/sessions/{}", id_of(&sessions, alias))),
-            ),
+                "session_ended",
+            )),
             (None, None, None) => None,
             _ => return Err(at("a step holds at most one event".into())),
         };
 
-        if let Some(request) = request {
+        // Kind and session id of the accepted event, if any.
+        let mut accepted = None;
+        if let Some((request, kind)) = request {
             let res = test::call_service(&app, request.to_request()).await;
             let code = res.status();
             let body: Value = test::read_body_json(res).await;
@@ -164,6 +174,9 @@ async fn run(scenario: &Scenario) -> Result<(), String> {
                     .ok_or(at("no session_id".into()))?;
                 sessions.insert(c.alias.clone(), (id, c.charger.clone(), c.connector));
             }
+            if code.is_success() {
+                accepted = Some((kind, body["session_id"].clone()));
+            }
         }
 
         let status: Value = test::call_and_read_body_json(
@@ -171,9 +184,57 @@ async fn run(scenario: &Scenario) -> Result<(), String> {
             test::TestRequest::get().uri("/status").to_request(),
         )
         .await;
+        let latest: Vec<Value> = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get().uri("/events?limit=1").to_request(),
+        )
+        .await;
         check_invariant(&status).map_err(at)?;
+        check_history(&mut last_seq, accepted, &latest, &status).map_err(at)?;
         check_expect(&step.expect, &status, &sessions).map_err(at)?;
     }
+    Ok(())
+}
+
+/// History invariant: an accepted event adds exactly one entry, of the right kind and session,
+/// whose resulting allocation matches `/status`; a rejected event (or none) adds nothing.
+fn check_history(
+    last_seq: &mut u64,
+    accepted: Option<(&str, Value)>,
+    latest: &[Value],
+    status: &Value,
+) -> Result<(), String> {
+    let seq = latest.first().map_or(0, |e| e["seq"].as_u64().unwrap_or(0));
+    let Some((kind, session_id)) = accepted else {
+        return match seq == *last_seq {
+            true => Ok(()),
+            false => Err(format!(
+                "history: no accepted event, yet seq went {last_seq} → {seq}"
+            )),
+        };
+    };
+    if seq != *last_seq + 1 {
+        return Err(format!(
+            "history: expected seq {}, got {seq}",
+            *last_seq + 1
+        ));
+    }
+    let entry = &latest[0];
+    if entry["kind"] != kind || entry["session_id"] != session_id {
+        return Err(format!(
+            "history: expected {kind} for {session_id}, got {entry}"
+        ));
+    }
+    let (recorded, live) = (
+        num(&entry["result"]["allocated_kw"]),
+        num(&status["allocated_kw"]),
+    );
+    if (recorded - live).abs() > EPS {
+        return Err(format!(
+            "history: result {recorded} kW differs from /status {live} kW"
+        ));
+    }
+    *last_seq = seq;
     Ok(())
 }
 

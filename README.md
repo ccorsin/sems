@@ -59,8 +59,9 @@ cargo test --release --test perf -- --ignored --nocapture   # performance
   allocation algorithm, malformed requests.
 - **Scenarios** (`scenarios/*.json`): event sequences replayed through the API, with expected
   setpoints, totals, statuses and HTTP codes. After **every step of every scenario** the runner
-  checks the safety invariant: no setpoint above its demand or connector, no charger or grid
-  overload.
+  checks two invariants: **safety** (no setpoint above its demand or connector, no charger or
+  grid overload) and **history** (an accepted event adds exactly one `/events` entry whose
+  resulting allocation matches `/status`; a rejected event adds none).
 - **Push** (`tests/push.rs`): a real server on a random port, real WebSocket and HTTP clients.
   A charger is told its new setpoint when *another* charger's event changes it, and is not
   disturbed when it does not.
@@ -118,6 +119,7 @@ All powers are in kW. Errors are `{"error": "<message>"}`.
 | `PUT` | `/sessions/{id}` | `{"demand_kw"}` | `200` | 404 unknown session, 422 |
 | `DELETE` | `/sessions/{id}` | — | `200` | 404 unknown session |
 | `GET` | `/status` | — | `200` | — |
+| `GET` | `/events?limit=100&session=<id>` | — | `200` | 422 invalid `limit` or `session` |
 | `GET` | `/chargers/{id}/setpoints` | — | `200`, or WebSocket upgrade | 404 unknown charger |
 
 Event responses: `{"session_id", "setpoint_kw", "status"}`, where `status` is the full
@@ -158,6 +160,25 @@ ignored (pings are answered). Closing the WebSocket releases nothing (see limita
 | `status` | `available`, `charging`, `suspended_ev` (plugged in, vehicle requests nothing), `suspended_evse` (plugged in, station gives nothing) — names from OCPP |
 | `status_since_ms` | Time of the last status change |
 
+### History (OPS diagnostics)
+
+`GET /events` returns the latest accepted events, oldest first: `limit` (default 100) and an
+optional `session` filter. Each entry holds the event **and the allocation that resulted from
+it**, so that a setpoint can be explained afterwards:
+
+```json
+{ "seq": 2, "at_ms": 1761040000000, "kind": "session_started",
+  "session_id": "4b2e…", "charger": "CP1", "connector": 2, "demand_kw": 300.0,
+  "result": { "allocated_kw": 300.0,
+              "setpoints": [ { "session_id": "9f1c…", "kw": 150.0 }, { "session_id": "4b2e…", "kw": 150.0 } ] } }
+```
+
+*"Why did my car charge at 150 kW?"* — `GET /events?session=<its id>` shows each of its events
+with the resulting split: here a second vehicle plugged into the same charger. `kind` is
+`session_started`, `demand_changed` or `session_ended`. The last 10,000 events are kept; `seq`
+never restarts, so a gap reveals dropped entries. Rejected events are not recorded.
+`allocated_kw ≤ grid_kw` on every entry is the safety audit.
+
 ## Key decisions
 
 Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
@@ -171,6 +192,8 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
 - **Full recomputation on every event**, under a single lock: the "Σ ≤ grid" invariant is
   global, and the computation takes microseconds.
 - **In-memory state**, no database: the hot path stays fast; history persistence is a later step.
+- **History recorded in the same operation as the event** (the model's single event path): an
+  entry can never be missing or out of step with the state; bounded ring buffer (`VecDeque`).
 
 ## Assumptions and limitations
 
@@ -200,7 +223,7 @@ Linear growth, far below the 1 s budget: end-to-end latency is dominated by the 
 
 | Version | Content |
 |---|---|
-| **V1** (in progress) | REST API ✅, scenarios ✅, Docker ✅, WebSocket push of setpoints ✅; next: `/events` history, metrics and end-to-end performance tests |
+| **V1** (in progress) | REST API ✅, scenarios ✅, Docker ✅, WebSocket push of setpoints ✅, `/events` history ✅; next: metrics and end-to-end performance tests |
 | V2 | Water-filling allocation: no waste, released power goes to the other sessions |
 | V3 | "Decrease before increase" transitions, minimum viable power per session, offline chargers |
 | V4 | Battery storage (BESS): boost, 10% SoC floor, opportunistic charging |

@@ -557,3 +557,35 @@ Three consecutive runs pass (no flakiness).
   server (which the developer knows), and lighter since it reuses `actix-http`: the dev build
   went from 199 to **165 crates** (154 for the binary alone). `api::serve(station, listener)`
   was extracted from `main.rs` so tests can start a server on port 0.
+
+---
+
+## Step 5 — V1, increment 5: `/events` history (2026-10-21)
+
+**Scope**: `src/model.rs` (history recorded by `Station::apply`), `src/api.rs` (`GET /events`),
+`tests/scenarios.rs` (history invariant), README (history section).
+
+**Result**: 20 unit tests + 15 scenarios + 3 push tests pass, `clippy` clean. The history
+invariant was checked against a deliberate bug (`seq` incremented by 2): every scenario fails at
+step 1 with `history: expected seq 1, got 2`.
+
+**Decisions**
+
+- **Recorded in the model, inside `Station::apply`**: the single path of every accepted event.
+  No accepted event can be missed, the entry is written after reallocation (so its `result` is
+  the post-event state), and rejected events never reach `apply`, so they are never recorded.
+  Stored in watts with indices; the API converts to kW and ids.
+- **`VecDeque`** (std ring buffer) with a capacity of 10,000: appending and dropping the oldest
+  entry are both O(1). Rejected: `Vec::remove(0)` (shifts every entry on each event, under the
+  lock), an unbounded `Vec` (memory grows forever), a hand-made ring index (re-implements
+  `VecDeque`).
+- **`seq` never restarts**, even when old entries are dropped: a reader detects gaps.
+- **Rejected events are not recorded** (for now): they stay visible in the HTTP response. A
+  documented option if OPS needs to trace refused attempts.
+- **History invariant in the scenario runner**, checked after every step like the safety one:
+  an accepted event adds exactly one entry (expected seq, kind and session) whose
+  `result.allocated_kw` equals `/status`; a rejected event adds none. The 15 existing scenarios
+  thus test the history without any new scenario file.
+- **Query validation**: an invalid `session` (not a UUID) or `limit` returns a JSON 422, like
+  other errors (`QueryConfig` error handler). An unknown session returns an empty list.
+- **`allocated_kw` is not stored**: it is derived from the recorded setpoints when rendering.
