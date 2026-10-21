@@ -2,6 +2,47 @@
 
 This journal traces the approach step by step: start with a simple version, then improve it.
 Each decision is recorded with the alternatives considered and the reason for the choice.
+The summary below gives the whole path at a glance; the steps that follow give the detail.
+
+## Summary
+
+**Goal.** Distribute a station's power across charging sessions without ever exceeding the grid,
+charger or connector limits (`grid > charger > connector > vehicle`), react in well under 1 s to
+every event, and expose it all through an API in Docker.
+
+**Architecture.** Rust with actix-web. The station lives in memory behind a single lock
+(`Mutex<Station>`): every event recomputes the whole allocation, which keeps the global
+invariant "Σ ≤ grid" simple, in microseconds. Powers are integer watts rounded down, so no sum
+can exceed a limit by rounding. The allocator is a pure function, separate from the API.
+Channels follow who speaks first: chargers send events and acknowledgements over HTTP; the
+server pushes setpoints over a WebSocket per charger (`/chargers/{id}/setpoints`, also readable
+by a plain GET). OPS reads `/status` and the history `/events`, where each event is stored with
+the allocation that resulted from it.
+
+**Versions.**
+
+| Version | What it does | Result |
+|---|---|---|
+| V1 | Capped equal share: `min(demand, connector, grid / n, charger / n_charger)`; REST API, `/status`, `/events`, WebSocket push, Docker | Safe, but up to 166.7 kW unused in the scenarios |
+| V2 | Max-min fair water-filling, first inside each charger, then across the grid | 0 kW unused in every scenario; end-to-end latency unchanged |
+| V3.1 | Decrease before increase: decreases are published at once; increases wait until every charger with a pending decrease acknowledges its latest version (`POST /chargers/{id}/ack`, version = event `seq`) | 0 kW of transition overshoot on every transition; a charger that never acknowledges freezes increases (documented limitation) |
+
+**Tests.** Unit tests on configuration, model and allocator; 20 declarative JSON scenarios, each
+with its `why`, replayed through the API with four properties checked after every request
+(safety, transition, history, consistency) and allocation metrics per scenario; a seeded
+randomized test (random stations and events, including invalid requests and late, stale, future
+or missing acknowledgements, with a shadow model predicting every HTTP code); push tests against
+a real server; performance tests. Every test family was verified against deliberate bugs.
+
+**Figures** (2017 MacBook Pro, native release build): an event on one charger reaches another
+charger's WebSocket in under 0.7 ms (the requirement is 1 s); about 5,000 events/s under a
+concurrent burst with the safety invariant checked on every response.
+
+**Assumptions.** Power modelled in kW, continuously divisible (no stacks); one server per
+station; a setpoint received is applied at once; state in memory; no authentication.
+
+**Next.** V3.2: offline chargers visible to OPS, and a timeout for a charger that never
+acknowledges. Later: minimum viable power per session.
 
 ---
 
@@ -789,3 +830,90 @@ scenario S17.
   33.3 / 22 / 33.3 kW, 11.3 kW wasted). Its fairness index (0.74) illustrates the Jain caveat.
 - Cosmetic fix: an empty `f64` sum is `-0.0` in Rust, which printed "-0.0" kW of waste for S01;
   `optimum_kw` now folds from `0.0`.
+
+---
+
+# V3 — Safe transitions: decrease before increase
+
+## Step 11 — V3 design (2026-10-21)
+
+**Problem**: V2 moves more power between chargers, and the metrics showed a potential transition
+overshoot of up to 113.3 kW: if a charger ramps up before another one has reduced, the grid is
+exceeded. Even with instant chargers, two chargers never receive their messages at the same
+moment.
+
+**Product input (PM)**: the grid limit is a hard boundary, not to be exceeded even briefly
+(breakers tolerate short overloads, but the design must not rely on it); a charger acknowledges
+the *reception* of a setpoint, not a measured power; a charger that does not confirm must block
+increases rather than risk an overload; priorities: safe transitions, then offline chargers
+visible to OPS, then minimum power. Ramp times need not be modelled: assume a setpoint received
+is applied at once.
+
+**Options considered**
+
+| Option | Verdict |
+|---|---|
+| Fixed delay before increases | Rejected: no guarantee (the grid is a hard limit) |
+| Permanent safety margin | Rejected: waste, the opposite of V2 |
+| Acknowledgement with a time-based fallback | Rejected: the fallback reintroduces the risk |
+| **Acknowledgement barrier** | **Chosen** |
+
+**Simplification pass** (the first proposal was reviewed for minimality):
+
+- Acknowledgements over **HTTP only**, not on the WebSocket: an acknowledgement is initiated by
+  the charger, like every other charger event. Rule kept everywhere: *who speaks first decides
+  the channel* (charger → HTTP, server → WebSocket). In production this would converge on a
+  single bidirectional WebSocket, as in OCPP.
+- **No per-charger counter**: the version of a charger's setpoints is the `seq` of the event that
+  last changed them. While a charger is awaited its setpoints can only go down, so the version
+  awaited is always its latest: per charger, only `version` and an `awaiting` flag remain.
+- **Station-wide, all or nothing**: a pending decrease holds every increase; an increase that
+  would already fit is held too. A finer barrier is documented, not built.
+- Acknowledgements are recorded in `/events` (kind `ack`): the answer to "why did B wait".
+- A charger whose sessions all ended stays awaited until it acknowledges (conservative).
+- Out of scope: ramp times, per-charger timeouts (documented as the next step), P4 (increase
+  delay measurement).
+
+**Why a version in the acknowledgement**: two decreases can be sent to the same charger faster
+than an acknowledgement travels back; acknowledging the first proves nothing about the second.
+Only the charger's latest version releases it; a version never sent is rejected.
+
+## Step 12 — V3.1a: model, API and runner (2026-10-21)
+
+**Scope**: `src/model.rs` (`target_w`, `ChargerLink`, `ack`, `grant`), `src/api.rs`
+(`POST /chargers/{id}/ack`, `version` in pushed messages, `target_kw` and `pending_acks` in
+`/status`, acknowledgements in `/events`), `tests/scenarios.rs` (auto/manual acknowledgements,
+`targets` and `pending` expectations), `tests/common/checks.rs` (transition invariant), scenarios
+S18–S20, push and perf tests updated.
+
+- **The rule fits in `Station::grant`**: decreases granted at once and their charger marked
+  awaited; increases granted only when no charger is awaited; versions bumped where published
+  setpoints changed.
+- **Transition invariant**, checked after every request: even if chargers still applied their
+  previous setpoints, no charger and not the grid would be exceeded. A first version counted the
+  setpoint of an *unplugged* vehicle and failed S05 and S13; the invariant was wrong, not the
+  server (a vehicle that left draws nothing), and now compares the same session only.
+- **The 17 existing scenarios kept every expected value** (auto mode describes the settled
+  station) and their overshoot dropped to 0. Disabling the barrier makes them fail with
+  `the grid could see 500 kW` and `charger "CP1" could draw 450 kW` — the charger-level
+  transition risk noted in V1 is now checked.
+- **P1 now measures a decrease** (published at once); an increase waits for the acknowledgement
+  round trip, which depends on the chargers.
+
+## Step 13 — V3.1b: random acknowledgements (2026-10-21)
+
+**Scope**: `tests/random.rs`.
+
+- Acknowledgements become random steps: latest, stale, future (422), unknown charger (404), or
+  never. Each run ends by acknowledging everything, which must settle the station with no waste.
+- Detected deliberate bugs: barrier off, decrease not awaited (transition check). The stale
+  acknowledgement rule (a single version comparison in the server) is tested by scenario S19.
+
+## Step 14 — V3.1c: documentation (2026-10-21)
+
+README: the communication asymmetry ("who speaks first", HTTP in, WebSocket out, and the OCPP
+single-socket target), safe transitions (rule, versions, assumption, silent-charger limitation
+and timeout idea with its caveat), API (ack route, `version`, `target_kw`, `pending_acks`),
+quick start with an acknowledgement, scenarios S18–S20, metrics V2 → V3 (overshoot 0 everywhere,
+and the price of safety while acknowledgements are pending), performance (V3 ranges over 3
+runs: P1 max 404–642 µs, P2 5,000–5,500 events/s).

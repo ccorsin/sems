@@ -8,8 +8,10 @@ leaves).
 Written in Rust (actix-web). The design process, every decision and the alternatives considered
 are traced step by step in [`JOURNAL.md`](JOURNAL.md).
 
-> Current version: **V2** — max-min fair water-filling: no power left unused while a vehicle
-> could take it. V1 (capped equal share) is on branch `v1`. See the [roadmap](#roadmap).
+> Current version: **V3.1** — max-min fair water-filling (no power left unused while a vehicle
+> could take it) and **safe transitions**: a decrease is applied before any increase, so the
+> grid is never exceeded, even while chargers apply their new setpoints. Earlier versions are on
+> branches `v1` and `v2`. See the [roadmap](#roadmap).
 
 ## Quick start
 
@@ -32,14 +34,23 @@ curl -X POST localhost:8080/sessions -H 'content-type: application/json' \
 # → 201 {"session_id": "<id-A>", "setpoint_kw": 300.0, "status": {…}}
 
 # A second vehicle on the other charger: both are capped by the 400 kW grid (200 kW each).
+# A is lowered to 200 kW at once, but B stays at 0 kW ("target_kw": 200) until CP1
+# acknowledges its decrease: "pending_acks": [{"charger": "CP1", "version": 2}].
 curl -X POST localhost:8080/sessions -H 'content-type: application/json' \
      -d '{"charger": "CP2", "connector": 1, "demand_kw": 300}'
 
-# The first vehicle's battery is nearly full: its demand drops.
+# CP1 acknowledges version 2 (a real charger does it as soon as it receives the message):
+# B gets its 200 kW.
+curl -X POST localhost:8080/chargers/CP1/ack -H 'content-type: application/json' -d '{"version": 2}'
+
+# The first vehicle's battery is nearly full: its demand drops to 50 kW. That is a decrease,
+# so CP1 must acknowledge again ("pending_acks": CP1, version 4) before B can take more.
 curl -X PUT localhost:8080/sessions/<id-A> -H 'content-type: application/json' -d '{"demand_kw": 50}'
 
-# It leaves.
+# It leaves. B still waits for CP1's acknowledgement (safety first, even though CP1 now has no
+# vehicle); once CP1 acknowledges version 4, B gets its full 300 kW.
 curl -X DELETE localhost:8080/sessions/<id-A>
+curl -X POST localhost:8080/chargers/CP1/ack -H 'content-type: application/json' -d '{"version": 4}'
 
 # OPS view: who is charging, at what power, what is left.
 curl localhost:8080/status
@@ -73,18 +84,23 @@ dev machine: P1 max ≈ 2 ms, P2 ≈ 2,500 events/s); the figures below were mea
   allocation algorithm, malformed requests.
 - **Scenarios** (`scenarios/*.json`): event sequences replayed through the API, with expected
   setpoints, totals, statuses and HTTP codes. After **every step of every scenario** the runner
-  checks three properties: **safety** (no setpoint above its demand or connector, no charger or
-  grid overload), **history** (an accepted event adds exactly one `/events` entry whose
-  resulting allocation matches `/status`; a rejected event adds none) and **consistency**
-  (`/status` totals and statuses match its sessions).
+  checks four properties: **safety** (no setpoint above its demand or connector, no charger or
+  grid overload), **transition** (even if chargers still applied their previous setpoints, no
+  charger or grid overload), **history** (an accepted request adds exactly one `/events` entry
+  whose resulting allocation matches `/status`; a rejected one adds none) and **consistency**
+  (`/status` totals and statuses match its sessions). By default the runner plays perfect
+  chargers that acknowledge at once (the intermediate state is checked first); scenarios with
+  `"acks": "manual"` acknowledge explicitly.
 - **Randomized** (`tests/random.rs`): random stations (1–5 chargers of 7–350 kW, 10–1500 kW grid)
-  and 100 random events each, including invalid targets and absurd demands. A shadow model
-  predicts every HTTP code; the same properties are checked after every event, plus **no waste
-  beyond rounding** (< 1 W per session). Seeded and reproducible: a failure prints its seed.
-  It tests what no hand-written scenario imagined.
+  and 100 random steps each, including invalid targets, absurd demands and acknowledgements that
+  are late, stale, for a future version, for an unknown charger, or never sent. A shadow model
+  predicts every HTTP code; the same properties are checked after every step, plus **no waste
+  beyond rounding** (< 1 W per session) once settled. Seeded and reproducible: a failure prints
+  its seed. It tests what no hand-written scenario imagined.
 - **Push** (`tests/push.rs`): a real server on a random port, real WebSocket and HTTP clients.
-  A charger is told its new setpoint when *another* charger's event changes it, and is not
-  disturbed when it does not.
+  A charger is told its new setpoint when *another* charger's event changes it, is not
+  disturbed when it does not, and an increase arrives only once the decreasing charger has
+  acknowledged.
 - **Performance** (`tests/perf.rs`): ignored by default, run in release mode.
 
 ### Scenarios
@@ -108,6 +124,9 @@ dev machine: P1 max ≈ 2 ms, P2 ≈ 2,500 events/s); the figures below were mea
 | S15 | Plugged in, not charging | Status `charging` → `suspended_ev` → `charging` for OPS |
 | S16 | Absurd demand values | Regression: powers above 1 GW are rejected (422) instead of overflowing |
 | S17 | Heterogeneous chargers under contention | Same mix as S09 on a 100 kW grid: the small AC charger is served in full, the others share the rest |
+| S18 | Increase waits for the acknowledgement | A decrease is published at once, the matching increase only after the acknowledgement; a departure frees power at once |
+| S19 | Stale acknowledgement | Acknowledging an older version releases nothing while a newer decrease is on its way |
+| S20 | Silent charger | Known limitation: a charger that never acknowledges freezes every increase (safety first) |
 
 Each file carries its own `why`. To add a scenario, drop a JSON file in `scenarios/`: it is
 picked up automatically. Format:
@@ -128,8 +147,65 @@ picked up automatically. Format:
 ```
 
 `config` is a path or an inline config. Every `expect` field is optional
-(`setpoints`, `statuses`, `allocated_kw`, `available_kw`, `unserved_kw`, `http`); without
-`http`, a 2xx is required.
+(`setpoints`, `targets`, `statuses`, `pending`, `allocated_kw`, `available_kw`, `unserved_kw`,
+`http`); without `http`, a 2xx is required. With `"acks": "manual"`, a step can be
+`{ "ack": "CP1" }` (its latest version) or `{ "ack": { "charger": "CP1", "version": 2 } }`.
+
+## Communication: who speaks first
+
+The interface is deliberately **asymmetric**, and one question decides each channel: *who
+initiates the exchange?*
+
+| Direction | Who speaks first | Channel | Messages |
+|---|---|---|---|
+| Charger → server | the charger | **HTTP** (REST) | session started, demand changed, session ended, **acknowledgement** |
+| Server → charger | **the server** | **WebSocket** | new setpoints |
+
+- Whatever happens *at* a charger (a vehicle plugs in, renegotiates, leaves; a setpoint was
+  received) is initiated by the charger: a plain HTTP request, answered by the server. Easy to
+  test with `curl`, and to replay in memory in the scenario runner.
+- New setpoints are initiated by **the server**: when B plugs into CP2, CP1 must lower A's power
+  although CP1 sent nothing. Plain HTTP cannot speak first (a server only answers); without a
+  push channel, CP1 would have to poll and latency would depend on the polling interval. The
+  WebSocket is that push channel (P1 below: about 0.5 ms from B's event to CP1's new setpoint).
+- The acknowledgement goes **from the charger to the server**, so it is an HTTP request like any
+  other charger event, even though the setpoint it acknowledges came over the WebSocket.
+- In a real deployment this would converge on **a single bidirectional WebSocket per charger**,
+  as OCPP does (events, setpoints and their acknowledgements on one connection). HTTP in was
+  kept for readability and testability.
+
+## Safe transitions: decrease before increase
+
+When B arrives, A must drop from 300 to 200 kW and B rise from 0 to 200 kW. If B applied its
+setpoint before A received its own, the site would briefly draw 500 kW on a 400 kW grid. The
+grid limit is treated as a hard boundary, never to be exceeded even briefly. So:
+
+1. **Decreases are published at once.** The charger concerned is then *awaited*.
+2. **Increases are held while any charger is awaited.** The session keeps its previous setpoint
+   (a new vehicle stays at 0 kW, status `suspended_evse`); `/status` shows its `target_kw`.
+3. **When the last awaited charger acknowledges, all held increases are granted.** An event that
+   only frees power (a departure, a lower demand on its own) grants its increases at once.
+
+Every session thus stays at or below a setpoint that was safe before the event: whatever order
+chargers receive their messages in, no charger and not the grid is ever exceeded (checked after
+every request by the scenario runner and the randomized test).
+
+**Versions.** Every pushed message carries a `version` (the `seq` of the event that last changed
+that charger's setpoints, see `/events`); the charger acknowledges it with
+`POST /chargers/{id}/ack {"version": n}`. Two decreases can be sent to the same charger faster
+than an acknowledgement travels back; an acknowledgement of the older one proves nothing about
+the newer one, so only the charger's latest version releases it (S19). A version never sent is
+rejected (422).
+
+**Assumption.** A setpoint received is applied at once (no ramp-time modelling): the
+acknowledgement of a reception therefore proves the charger draws at most its new setpoint.
+
+**Known limitation: a charger that never acknowledges** (failure, lost link) freezes every
+increase on the station (S20). This is the safe side, and OPS sees which charger blocks in
+`pending_acks`. The natural next step is a timeout after which the charger is reported as
+failed and excluded from the allocation; note that excluding it assumes it fell back to a
+safe setpoint on its own (as OCPP's fallback profiles do), which the server cannot verify.
+Also: OPS ending its sessions with `DELETE` does not release a silent charger's hold.
 
 ## API
 
@@ -140,12 +216,15 @@ All powers are in kW. Errors are `{"error": "<message>"}`.
 | `POST` | `/sessions` | `{"charger", "connector", "demand_kw"}` | `201` | 404 unknown charger/connector, 409 connector busy, 422 invalid body or demand (powers are 0 to 1,000,000 kW) |
 | `PUT` | `/sessions/{id}` | `{"demand_kw"}` | `200` | 404 unknown session, 422 |
 | `DELETE` | `/sessions/{id}` | — | `200` | 404 unknown session |
+| `POST` | `/chargers/{id}/ack` | `{"version"}` | `200` | 404 unknown charger, 422 version never sent |
 | `GET` | `/status` | — | `200` | — |
 | `GET` | `/events?limit=100&session=<id>` | — | `200` | 422 invalid `limit` or `session` |
 | `GET` | `/chargers/{id}/setpoints` | — | `200`, or WebSocket upgrade | 404 unknown charger |
 
-Event responses: `{"session_id", "setpoint_kw", "status"}`, where `status` is the full
-station state (a demo convenience: a real charger should only see its own setpoints).
+Session event responses: `{"session_id", "setpoint_kw", "target_kw", "status"}`; an
+acknowledgement answers `{"status"}`. `status` is the full station state (a demo convenience: a
+real charger should only see its own setpoints). `setpoint_kw` is what is granted, possibly
+below `target_kw` while an increase is held.
 
 ### Setpoints for chargers (push and pull)
 
@@ -156,8 +235,9 @@ A plain **GET** on the same URL returns the same message: a pull fallback while 
 reconnects.
 
 ```json
-{ "charger": "CP1", "setpoints": [ { "connector": 1, "session_id": "9f1c…", "kw": 200 },
-                                   { "connector": 2, "session_id": null, "kw": 0 } ] }
+{ "charger": "CP1", "version": 7,
+  "setpoints": [ { "connector": 1, "session_id": "9f1c…", "kw": 200 },
+                 { "connector": 2, "session_id": null, "kw": 0 } ] }
 ```
 
 Try it from a browser console (nothing to install), then post events with `curl`:
@@ -167,15 +247,18 @@ const ws = new WebSocket("ws://localhost:8080/chargers/CP1/setpoints");
 ws.onmessage = (m) => console.log(m.data);
 ```
 
-Events still go through the REST routes; messages sent by the charger on the WebSocket are
-ignored (pings are answered). Closing the WebSocket releases nothing (see limitations).
+Messages sent by the charger on the WebSocket are ignored (pings are answered): events and
+acknowledgements go over HTTP. Closing the WebSocket releases nothing (see limitations).
 
 `GET /status` exposes, per station, charger and connector:
 
 | Field | Meaning |
 |---|---|
 | `demand_kw` | What the vehicle accepts right now (input) |
-| `setpoint_kw` | What the station allows (output), always ≤ `demand_kw` |
+| `setpoint_kw` | What the station grants and publishes (output), always ≤ `demand_kw` |
+| `target_kw` | What the allocator would give; above `setpoint_kw` while an increase is held |
+| `pending_acks` | Station level: chargers whose acknowledgement is awaited, with the version to acknowledge |
+| `version` | Charger level: version of its latest setpoints |
 | `allocated_kw` | Sum of setpoints |
 | `available_kw` | Grid headroom (not necessarily usable: a charger may be saturated) |
 | `unserved_kw` | Unmet demand: Σ (demand − setpoint) |
@@ -197,8 +280,10 @@ it**, so that a setpoint can be explained afterwards:
 
 *"Why did my car charge at 150 kW?"* — `GET /events?session=<its id>` shows each of its events
 with the resulting split: here a second vehicle plugged into the same charger. `kind` is
-`session_started`, `demand_changed` or `session_ended`. The last 10,000 events are kept; `seq`
-never restarts, so a gap reveals dropped entries. Rejected events are not recorded.
+`session_started`, `demand_changed`, `session_ended` or `ack` (with `version`, and `null`
+session fields): *"why did B wait 2 s at 0 kW?"* is answered by the `ack` entry that released it.
+The last 10,000 events are kept; `seq` never restarts, so a gap reveals dropped entries; it is
+also the `version` of pushed setpoints. Rejected requests are not recorded.
 `allocated_kw ≤ grid_kw` on every entry is the safety audit.
 
 ## Key decisions
@@ -236,18 +321,26 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
 - **In-memory state**, no database: the hot path stays fast; history persistence is a later step.
 - **History recorded in the same operation as the event** (the model's single event path): an
   entry can never be missing or out of step with the state; bounded ring buffer (`VecDeque`).
+- **Decrease before increase** (V3): a station-wide acknowledgement barrier, all or nothing,
+  versions taken from the history's `seq`. Simplest rule that keeps the grid safe during
+  transitions; see [Safe transitions](#safe-transitions-decrease-before-increase).
+- **HTTP in, WebSocket out**: see [Communication](#communication-who-speaks-first).
 
 ## Assumptions and limitations
 
 - Power is modelled in kW (real chargers are often driven in amperes) and is continuously
   divisible (internal charger "stacks" are not modelled).
 - One server per station. No authentication. State is lost on restart.
-- Chargers are assumed to apply setpoints instantly; the transition risk (a vehicle ramping up
-  before another one has reduced) is addressed in V3 ("decrease before increase").
+- A setpoint received is assumed applied at once (no ramp time modelled); an acknowledgement
+  confirms reception, not a measured power.
+- A charger that never acknowledges freezes every increase on the station (S20); timeout and
+  exclusion are the documented next step (see [Safe transitions](#safe-transitions-decrease-before-increase)).
+- The barrier is **station-wide and all or nothing**: a pending decrease on one charger also
+  holds increases on unrelated chargers, and an increase that would already fit is held too.
+  A finer barrier would serve faster at the cost of more logic.
 - A charger that disappears without ending its session keeps its power reserved (safety first);
-  OPS can release it with `DELETE /sessions/{id}`.
-- Setpoint push is fire-and-forget: there is no acknowledgement that a charger applied its new
-  setpoint yet (needed for "decrease before increase", V3).
+  OPS can end its sessions with `DELETE /sessions/{id}`, which does not lift a pending
+  acknowledgement.
 
 ## Performance
 
@@ -257,23 +350,27 @@ machine, so these are upper bounds; max values vary with OS scheduling.
 
 | Test | What | p50 | p99 | max |
 |---|---|---|---|---|
-| **P1** | Event on one charger → new setpoint received over WebSocket by **another** charger (200 runs) | 160–168 µs | 358–396 µs | 408–513 µs |
-| **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.0–1.1 ms | 2.9–3.5 ms | 4.5 ms (one 35 ms outlier) |
-| **P3** | Allocation alone, 4 sessions | 1.0 µs | 6–7 µs | ≤ 77 µs |
-| | Allocation alone, 100 sessions | 13 µs | 35–44 µs | ≤ 79 µs |
-| | Allocation alone, 10,000 sessions | 1.3 ms | 1.9–2.2 ms | ≤ 2.6 ms |
+| **P1** | Event on one charger → **decrease** received over WebSocket by **another** charger (200 runs) | 197–220 µs | 352–475 µs | 404–642 µs |
+| **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.1–1.2 ms | 3.1–3.5 ms | 7.6–8.5 ms |
+| **P3** | Allocation alone, 4 sessions | 1.0–1.5 µs | 2–8 µs | ≤ 27 µs |
+| | Allocation alone, 100 sessions | 13 µs | 19–65 µs | ≤ 183 µs |
+| | Allocation alone, 10,000 sessions | 1.3 ms | 1.7–2.4 ms | ≤ 9 ms (one 44 ms outlier) |
 
-- **P1, the brief's requirement** (< 1 s): the worst case measured is about 0.5 ms, some
-  2,000 times below the budget.
-- **P2**: **5,600–5,900 events/s** with the safety invariant checked on every one of the
+- **P1, the brief's requirement** (< 1 s): the worst case measured is about 0.6 ms, some
+  1,500 times below the budget. P1 measures a **decrease**, the safety-critical direction,
+  published at once. Since V3 an increase additionally waits for the decreasing chargers'
+  acknowledgement round trip: that delay depends on the chargers, not on the server.
+- **P2**: **5,000–5,500 events/s** with the safety invariant checked on every one of the
   4,000 responses, and every event found in `/events`. A real station sees a few events per
   second: this is headroom, not a target. Each response carries the full station state,
   which is part of this cost.
-- **P3**: the water-filling (sort, O(n log n)) is about 5 times slower than V1's equal share
-  (250 µs at 10,000 sessions), yet **end-to-end latency is unchanged** (V1: P1 max 444–582 µs,
-  P2 5,300–5,900 events/s): computation is never the bottleneck, the network is.
+- **Across versions**: the water-filling (V2, a sort, O(n log n)) made the allocation about
+  5 times slower than V1's equal share (250 µs → 1.3 ms at 10,000 sessions), and the V3
+  barrier adds a pass over the sessions; yet end-to-end figures barely move (P1 max: V1
+  444–582 µs, V2 408–513 µs, V3 404–642 µs; P2: 5,300–5,900, 5,600–5,900, 5,000–5,500 events/s).
+  Computation is never the bottleneck, the network is.
 
-## Allocation metrics: V1 → V2
+## Allocation metrics: V1 → V2 → V3
 
 Computed by the scenario runner (`cargo test --test scenarios -- --nocapture`), worst case
 over each scenario's steps. Optimum = the most power deliverable within every limit:
@@ -286,9 +383,9 @@ over each scenario's steps. Optimum = the most power deliverable within every li
 | Satisfaction (%) | `allocated / Σ demand` (below 100 % is normal when the station is saturated) |
 | Fairness | Jain's index over `setpoint / demand` ratios; 1 = perfectly even |
 | Churn (setpoints/event) | Setpoints changed per accepted event: how many chargers are disturbed |
-| Overshoot (kW) | Grid overload if every charger applied the larger of its old and new setpoint during a transition |
+| Overshoot (kW) | Grid overload if every charger applied the larger of its old and new setpoint during a transition (since V3: measured on every transition, intermediate states included) |
 
-**What changed** (scenarios whose metrics moved; the full V1 table is in `JOURNAL.md`, step 6):
+**V1 → V2: no waste** (scenarios whose metrics moved; the full V1 table is in `JOURNAL.md`, step 6):
 
 | Scenario | Waste V1 → V2 (kW) | Efficiency V1 → V2 (%) | Fairness V1 → V2 | Churn V1 → V2 (setpoints/event) | Overshoot V1 → V2 (kW) |
 |---|---|---|---|---|---|
@@ -299,36 +396,55 @@ over each scenario's steps. Optimum = the most power deliverable within every li
 | S13 cascading release | 113.3 → **0.0** | 68.8 → **100.0** | 0.85 → 0.95 | 2.4 → 2.7 | 100.0 → 113.3 |
 | S15 plugged in, not charging | 30.0 → **0.0** | 90.0 → **100.0** | 0.90 → 0.94 | 1.8 → 1.8 | 50.0 → 50.0 |
 
-**V2, all scenarios:**
+**V2 → V3: no transition overshoot** (every scenario that had one):
+
+| Scenario | Overshoot V2 → V3 (kW) |
+|---|---|
+| S03, S15 | 50.0 → **0.0** |
+| S04, S05, S06, S07, S12, S14, S16 | 100.0 → **0.0** |
+| S13 cascading release | 113.3 → **0.0** |
+| S17 heterogeneous chargers under contention | 39.0 → **0.0** |
+
+**V3, all scenarios** (S01–S17 measured on the settled station; S18–S20 acknowledge manually,
+so their figures include the time spent waiting for acknowledgements):
 
 | Scenario | Waste max (kW) | Efficiency min (%) | Satisfaction min (%) | Fairness min | Churn avg (setpoints/event) | Overshoot max (kW) |
 |---|---|---|---|---|---|---|
 | S01 empty station | 0.0 | 100.0 | 100.0 | 1.00 | 0.0 | 0.0 |
 | S02 single vehicle | 0.0 | 100.0 | 85.7 | 1.00 | 1.0 | 0.0 |
-| S03 two vehicles on the same charger | 0.0 | 100.0 | 50.0 | 1.00 | 1.5 | 50.0 |
-| S04 two vehicles on different chargers | 0.0 | 100.0 | 66.7 | 1.00 | 1.5 | 100.0 |
-| S05 a vehicle leaves | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
-| S06 full station | 0.0 | 100.0 | 33.3 | 1.00 | 2.5 | 100.0 |
-| S07 demand decreases then increases | 0.0 | 100.0 | 66.7 | 1.00 | 1.8 | 100.0 |
+| S03 two vehicles on the same charger | 0.0 | 100.0 | 50.0 | 1.00 | 1.5 | 0.0 |
+| S04 two vehicles on different chargers | 0.0 | 100.0 | 66.7 | 1.00 | 1.5 | 0.0 |
+| S05 a vehicle leaves | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 0.0 |
+| S06 full station | 0.0 | 100.0 | 33.3 | 1.00 | 2.5 | 0.0 |
+| S07 demand decreases then increases | 0.0 | 100.0 | 66.7 | 1.00 | 1.8 | 0.0 |
 | S08 demand above the connector limit | 0.0 | 100.0 | 50.0 | 1.00 | 1.0 | 0.0 |
 | S09 heterogeneous chargers | 0.0 | 100.0 | 100.0 | 1.00 | 1.0 | 0.0 |
 | S10 saturated charger's share goes to the other charger | 0.0 | 100.0 | 50.0 | 0.98 | 1.3 | 0.0 |
 | S11 invalid events | 0.0 | 100.0 | 100.0 | 1.00 | 1.0 | 0.0 |
-| S12 demand increase under contention | 0.0 | 100.0 | 66.7 | 1.00 | 1.5 | 100.0 |
-| S13 cascading release | 0.0 | 100.0 | 33.3 | 0.95 | 2.7 | 113.3 |
-| S14 zero demand takes no share | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
-| S15 plugged in but not charging | 0.0 | 100.0 | 50.0 | 0.94 | 1.8 | 50.0 |
-| S16 absurd demand values | 0.0 | 100.0 | 0.0 | 1.00 | 1.5 | 100.0 |
-| S17 heterogeneous chargers under contention | 0.0 | 100.0 | 26.9 | 0.74 | 1.7 | 39.0 |
+| S12 demand increase under contention | 0.0 | 100.0 | 66.7 | 1.00 | 1.5 | 0.0 |
+| S13 cascading release | 0.0 | 100.0 | 33.3 | 0.95 | 2.7 | 0.0 |
+| S14 zero demand takes no share | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 0.0 |
+| S15 plugged in but not charging | 0.0 | 100.0 | 50.0 | 0.94 | 1.8 | 0.0 |
+| S16 absurd demand values | 0.0 | 100.0 | 0.0 | 1.00 | 1.5 | 0.0 |
+| S17 heterogeneous chargers under contention | 0.0 | 100.0 | 26.9 | 0.74 | 1.7 | 0.0 |
+| S18 increase waits for the acknowledgement | 200.0 | 50.0 | 33.3 | 0.50 | 1.2 | 0.0 |
+| S19 stale acknowledgement | 266.7 | 33.3 | 14.8 | 0.33 | 1.0 | 0.0 |
+| S20 silent charger freezes increases | 200.0 | 50.0 | 33.3 | 0.50 | 0.5 | 0.0 |
 
 **Reading**
 
 - **Gain**: waste drops to **0 kW in every scenario** (V1: up to 166.7 kW) and efficiency is
   100 % everywhere; the randomized test confirms it on random stations (< 1 W per session).
-- **Cost, assumed**: redistributing disturbs more chargers (churn up to +0.6 setpoints/event)
-  and moves more power between chargers, so the **potential transition overshoot grows**
-  (S12: 0 → 100 kW, S13: 100 → 113.3 kW). This makes "decrease before increase" (V3) the next
-  priority.
+- **Cost of V2, assumed**: redistributing disturbs more chargers (churn up to +0.6
+  setpoints/event) and moved more power between chargers, so the potential transition
+  overshoot grew (S12: 0 → 100 kW, S13: 100 → 113.3 kW).
+- **V3 removes it**: overshoot is **0 kW on every transition of every scenario**, intermediate
+  states included (the runner checks them before acknowledging), and the randomized test checks
+  it with acknowledgements arriving late, stale or never.
+- **Price of V3's safety**: while a charger has not acknowledged, increases wait. S18–S20 show
+  it: up to 266.7 kW unused while acknowledgements are pending (S19), and indefinitely if a
+  charger stays silent (S20). With real chargers acknowledging within milliseconds, the
+  settled figures (S01–S17) are what a station sees.
 - **Fairness must be read with care**: Jain's index compares service *ratios*, not what each
   vehicle *could* get. In S17 it is 0.74 although the split is max-min optimal: the 300 kW
   vehicle gets 39 kW (13 %) on a 100 kW grid, the 22 kW one is served in full (100 %). In S10
@@ -341,5 +457,7 @@ over each scenario's steps. Optimum = the most power deliverable within every li
 |---|---|
 | **V1** ✅ | REST API, scenarios, Docker, WebSocket push of setpoints, `/events` history, allocation metrics, end-to-end performance tests |
 | **V2** ✅ | Max-min fair water-filling: no waste, released power goes to the other sessions; randomized property test (random stations and events, properties at every step) |
-| V3 | "Decrease before increase" transitions, minimum viable power per session, offline chargers |
+| **V3.1** ✅ | Safe transitions: decrease before increase, versioned acknowledgements over HTTP, transition invariant checked everywhere |
+| V3.2 | Offline chargers visible to OPS (WebSocket lost); timeout for a charger that never acknowledges |
+| Later | Minimum viable power per session (UX more than safety); finer acknowledgement barrier |
 | V4 | Battery storage (BESS): boost, 10% SoC floor, opportunistic charging |
