@@ -1050,3 +1050,7 @@ client (connection reuse). A test-side fix; the server was not involved.
 - Added a **full-station case** (3 → 4 sessions, both chargers decrease and must acknowledge before
   the fourth vehicle gets 100 kW) and an "active sessions" column: median about 2 ms, worst case
   377 ms observed.
+- **P1 removed** (event → decrease pushed to another charger): P4 measures the same first link
+  and the rest of the cascade. Historical P1 maxima: V1 444–582 µs, V2 408–513 µs, V3 404–642 µs,
+  V4 325–385 µs. Kept: P2 (the only concurrency test, safety invariant under load) and P3
+  (allocator scaling).

@@ -5,15 +5,13 @@
 //! P4 measures, per event type, the time until **every** affected charger has its final setpoint,
 //! acknowledgement round trips included (the brief's < 1 s is about the whole cascade).
 //!
-//! P1, P2 and P4 run client and server on the same machine: figures include the client's own cost
+//! P2 and P4 run client and server on the same machine: figures include the client's own cost
 //! and are upper bounds. Every event response carries the full station state, so P2 also
 //! measures that serialization.
 
 mod common;
 use awc::ws::Frame;
-use common::{
-    ack, brief, change_demand, connect, get, kw, next, next_within, settle, start, subscribe,
-};
+use common::{ack, brief, change_demand, connect, get, kw, start, subscribe};
 use futures_util::future::join_all;
 use futures_util::StreamExt;
 use sems::allocator::{allocate, Demand};
@@ -31,45 +29,6 @@ fn report(label: &str, mut times: Vec<Duration>) -> Duration {
     let (p50, p99, max) = (times[n / 2], times[n * 99 / 100], times[n - 1]);
     println!("{label:>16} | {p50:>10.1?} | {p99:>10.1?} | {max:>10.1?}");
     max
-}
-
-/// P1 — the brief's requirement: an event on one charger changes another charger's setpoint;
-/// time from sending the event to that other charger receiving it over its WebSocket.
-#[actix_web::test]
-#[ignore]
-async fn p1_event_to_push_latency() {
-    const RUNS: usize = 200;
-    let addr = start(&brief());
-    let mut cp1 = subscribe(&addr, "CP1").await;
-    next(&mut cp1).await.unwrap();
-    connect(&addr, "CP1", 1, 300.0).await;
-    next(&mut cp1).await.unwrap();
-    let b = connect(&addr, "CP2", 1, 300.0).await;
-    assert_eq!(kw(&next(&mut cp1).await.unwrap(), 1), 200.0);
-
-    // Untimed: B drops to 0 kW and the chargers settle, so A is back to 300 kW. Timed: B asks
-    // for 300 kW again and A's decrease to 200 kW reaches CP1. A decrease is published at once;
-    // an increase waits for acknowledgements (decrease before increase), hence this direction.
-    let client = awc::Client::new();
-    let mut times = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        settle(&addr).await;
-        change_demand(&client, &addr, &b, 0.0).await;
-        settle(&addr).await;
-        assert_eq!(kw(&next(&mut cp1).await.unwrap(), 1), 300.0);
-
-        let start = Instant::now();
-        let (code, _) = change_demand(&client, &addr, &b, 300.0).await;
-        let pushed = next_within(&mut cp1, Duration::from_secs(1)).await;
-        times.push(start.elapsed());
-        assert_eq!(code, 200);
-        assert_eq!(kw(&pushed.expect("push within 1 s"), 1), 200.0);
-    }
-
-    println!("\nP1 event → push to another charger ({RUNS} runs)");
-    println!("{:>16} | {:>10} | {:>10} | {:>10}", "", "p50", "p99", "max");
-    let max = report("latency", times);
-    assert!(max < Duration::from_secs(1), "brief requirement: < 1 s");
 }
 
 /// P2 — burst of concurrent events: throughput, per-request latency, and the safety invariant

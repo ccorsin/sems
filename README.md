@@ -80,7 +80,7 @@ Natively (stable Rust): the same commands without `docker compose run --rm test`
 `cargo test` or `cargo test --test scenarios -- --nocapture`.
 
 Performance figures measured inside Docker on macOS include the Docker VM's overhead (on the
-dev machine: P1 max ≈ 2 ms, P2 ≈ 2,500 events/s); the figures below were measured natively.
+dev machine: P2 ≈ 2,500 events/s); the figures below were measured natively.
 
 - **Unit tests** (`src/*.rs`): configuration validation, session lifecycle and statuses,
   allocation algorithm, malformed requests.
@@ -177,7 +177,7 @@ initiates the exchange?*
 - New setpoints are initiated by **the server**: when B plugs into CP2, CP1 must lower A's power
   although CP1 sent nothing. Plain HTTP cannot speak first (a server only answers); without a
   push channel, CP1 would have to poll and latency would depend on the polling interval. The
-  WebSocket is that push channel (P1 below: about 0.5 ms from B's event to CP1's new setpoint).
+  WebSocket is that push channel (P4 below: about 2 ms from B's event to the end of the cascade).
 - The acknowledgement goes **from the charger to the server**, so it is an HTTP request like any
   other charger event, even though the setpoint it acknowledges came over the WebSocket.
 - In a real deployment this would converge on **a single bidirectional WebSocket per charger**,
@@ -459,7 +459,6 @@ machine, so these are upper bounds; max values vary with OS scheduling.
 
 | Test | What | p50 | p99 | max |
 |---|---|---|---|---|
-| **P1** | Event on one charger → **decrease** received over WebSocket by **another** charger (200 runs) | 192–199 µs | 316–382 µs | 325–385 µs |
 | **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.2 ms | 3.6–4.4 ms | 7.2–23 ms |
 | **P3** | Allocation alone, 4 sessions | 1.0 µs | 6–12 µs | ≤ 61 µs |
 | | Allocation alone, 100 sessions | 13 µs | 17–37 µs | ≤ 72 µs |
@@ -487,19 +486,15 @@ simulated chargers share one 2017 laptop). The full-station case, the heaviest t
 station allows (two acknowledgements before the increase), stays under 0.4 s at worst. With real
 chargers, network latency would add to these figures.
 
-- **P1, the brief's requirement** (< 1 s): the worst case measured is about 0.4 ms, some
-  2,500 times below the budget. P1 measures a **decrease**, the safety-critical direction,
-  published at once. Since V3 an increase additionally waits for the decreasing chargers'
-  acknowledgement round trip: that delay depends on the chargers, not on the server.
 - **P2**: **4,600–4,950 events/s** with the safety invariant checked on every one of the
   4,000 responses, and every event found in `/events`. A real station sees a few events per
   second: this is headroom, not a target. Each response carries the full station state,
   which is part of this cost.
 - **Across versions**: the water-filling (V2, a sort, O(n log n)) made the allocation about
   5 times slower than V1's equal share (250 µs → 1.3 ms at 10,000 sessions), and the V3
-  barrier adds a pass over the sessions; yet end-to-end figures barely move (P1 max: V1
-  444–582 µs, V2 408–513 µs, V3 404–642 µs, V4 325–385 µs; P2: 5,300–5,900, 5,600–5,900,
-  5,000–5,500, 4,600–4,950 events/s; V4 responses also carry the BESS block).
+  barrier adds a pass over the sessions; yet end-to-end figures barely move (P2: 5,300–5,900,
+  5,600–5,900, 5,000–5,500, 4,600–4,950 events/s from V1 to V4; V4 responses also carry the
+  BESS block).
   Computation is never the bottleneck, the network is.
 
 ## Allocation metrics: V1 → V2 → V3
