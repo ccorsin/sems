@@ -1,5 +1,8 @@
-//! Helpers shared by the tests that run a real server (`push.rs`, `perf.rs`).
+//! Helpers shared by the integration tests: real server and clients (`push.rs`, `perf.rs`),
+//! and the properties checked after every step ([`checks`]: `scenarios.rs`, `random.rs`).
 #![allow(dead_code)] // Each test crate uses a subset.
+
+pub mod checks;
 
 use awc::ws::Frame;
 use futures_util::{Stream, StreamExt};
