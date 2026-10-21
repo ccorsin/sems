@@ -403,18 +403,23 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
 
 - Power is modelled in kW (real chargers are often driven in amperes) and is continuously
   divisible (internal charger "stacks" are not modelled).
-- One server per station. No authentication. State is lost on restart.
+- One server per station. State is lost on restart (not handled).
 - A setpoint received is assumed applied at once (no ramp time modelled); an acknowledgement
   confirms reception, not a measured power.
 - **BESS**: the SoC is an input from the BMS (not computed); the BESS regulates the grid
   connection locally and applies its mode almost instantly; no hysteresis around the 10 % floor,
-  so a SoC oscillating around it switches the boost on and off.
+  so a SoC oscillating around it switches the boost on and off (a UX defect; hysteresis is the
+  natural improvement).
 - **No minimum viable power per session (not covered).** With many vehicles on a small grid,
   shares can become too small to be useful. The sketched rule: a configurable minimum; sessions
   admitted in arrival order while each can get it; the others wait at 0 kW as `suspended_evse`,
   re-evaluated on every event. Not needed for the brief's station (at least 100 kW per vehicle).
-- A charger that never acknowledges freezes every increase on the station (S20); timeout and
-  exclusion are the documented next step (see [Safe transitions](#safe-transitions-decrease-before-increase)).
+- **Silent charger.** Current behaviour: maximum safety, a charger that never acknowledges
+  freezes every increase on the station (S20). Limitation: no graceful degradation when a single
+  charger fails. Next step: a timeout after which the charger is marked failed, excluded from the
+  allocation and reported to OPS, so the rest of the station works normally.
+- **Starvation of increases** under heavy activity is the price of the station-wide barrier; the
+  delay before an increase is granted is a metric to instrument in production.
 - The barrier is **station-wide and all or nothing**: a pending decrease on one charger also
   holds increases on unrelated chargers, and an increase that would already fit is held too.
   A finer barrier would serve faster at the cost of more logic.
@@ -425,6 +430,27 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
   `GET /chargers/{id}/setpoints` shows as offline. Connections and disconnections are logged on
   stdout, not recorded in `/events`.
 
+### Known risks (assumed, not solved)
+
+- **No authentication.** A malicious actor could spoof an acknowledgement or falsify a SoC and
+  influence the physical safety of the system (lift the barrier, trigger a boost). A real
+  deployment needs authentication and validation of charger and BESS inputs.
+- **The BESS is not measured.** The server computes `grid_import_kw`, it does not measure it: a
+  BESS drifting from its expected behaviour would go undetected, which would be unacceptable in
+  production. A meter at the grid connection should be read and checked.
+- **Stale SoC.** If the BMS stops reporting, the last SoC is kept: the station may keep planning
+  a boost while the battery actually drains, and the 10 % floor then gives a false sense of
+  safety. Same principle as the silent charger: a critical input must not be trusted forever.
+  Fixing it properly needs a watchdog timer (the system is otherwise purely event-driven: a
+  check on the next event only would leave a quiet station unprotected); the same watchdog
+  would implement the charger acknowledgement timeout.
+- **A panic while holding the station lock stops the service** — a deliberate fail-safe. A panic
+  means an invariant was broken; carrying on with a possibly corrupted state could grant power
+  beyond the limits. Stopped, the server publishes nothing: chargers keep their last setpoints,
+  which were safe, and no increase is granted; supervision detects the outage. Inputs that could
+  panic are rejected at the edge (powers above 1 GW, invalid SoC). Possible evolution: apply each
+  event to a copy of the state and roll back on panic, so only the faulty request fails.
+
 ## Performance
 
 `cargo test --release --test perf -- --ignored --nocapture --test-threads=1`. Release build,
@@ -433,24 +459,47 @@ machine, so these are upper bounds; max values vary with OS scheduling.
 
 | Test | What | p50 | p99 | max |
 |---|---|---|---|---|
-| **P1** | Event on one charger → **decrease** received over WebSocket by **another** charger (200 runs) | 197–220 µs | 352–475 µs | 404–642 µs |
-| **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.1–1.2 ms | 3.1–3.5 ms | 7.6–8.5 ms |
-| **P3** | Allocation alone, 4 sessions | 1.0–1.5 µs | 2–8 µs | ≤ 27 µs |
-| | Allocation alone, 100 sessions | 13 µs | 19–65 µs | ≤ 183 µs |
-| | Allocation alone, 10,000 sessions | 1.3 ms | 1.7–2.4 ms | ≤ 9 ms (one 44 ms outlier) |
+| **P1** | Event on one charger → **decrease** received over WebSocket by **another** charger (200 runs) | 192–199 µs | 316–382 µs | 325–385 µs |
+| **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.2 ms | 3.6–4.4 ms | 7.2–23 ms |
+| **P3** | Allocation alone, 4 sessions | 1.0 µs | 6–12 µs | ≤ 61 µs |
+| | Allocation alone, 100 sessions | 13 µs | 17–37 µs | ≤ 72 µs |
+| | Allocation alone, 10,000 sessions | 1.3–1.4 ms | 2.0–2.2 ms | ≤ 14 ms |
 
-- **P1, the brief's requirement** (< 1 s): the worst case measured is about 0.6 ms, some
-  1,500 times below the budget. P1 measures a **decrease**, the safety-critical direction,
+**P4 — the brief's requirement, end to end.** What counts is the time from an event until
+**every affected charger holds its final setpoint**, the whole cascade included. Simulated
+chargers (one WebSocket each) acknowledge every setpoint as soon as they receive it, as real
+ones would; in "cascade" cases the measure includes the decrease, its acknowledgement round trip
+and the increase it releases. 200 runs per case, ranges over 3 runs:
+
+| Event | Active sessions | Ends when | p50 | p99 | max |
+|---|---|---|---|---|---|
+| Connect, no cascade | 0 → 1 | A receives 300 kW | 1.1–1.9 ms | 2.0–3.9 ms | 2.1–149 ms |
+| Connect, **cascade** | 1 → 2 | B plugs in: A receives 200 kW, acknowledges, then **B receives 200 kW** | 1.7–3.3 ms | 2.8–98 ms | 5.6–125 ms |
+| Disconnect, no cascade | 1 → 0 | A leaves: CP1 receives 0 kW | 1.1–1.7 ms | 2.2–8.6 ms | 10–58 ms |
+| Disconnect, **cascade** | 2 → 1 | A leaves: **B receives 300 kW** | 1.1–2.1 ms | 2.0–160 ms | 2.0–197 ms |
+| Demand down, **cascade** | 2 | A drops to 50 kW, acknowledges, then **B receives 300 kW** | 1.7–2.3 ms | 2.5–167 ms | 2.6–285 ms |
+| Demand up, **cascade** | 2 | A asks 300 kW: B receives 200 kW, acknowledges, then **A receives 200 kW** | 1.7–2.1 ms | 5.4–187 ms | 18–289 ms |
+| **Full station**, cascade on both chargers | 3 → 4 | D plugs into CP2: A, B (CP1) and C (CP2) drop to 100 kW, **both chargers acknowledge**, then **D receives 100 kW** | 1.8–2.0 ms | 7.1–305 ms | 8.2–377 ms |
+
+Every case, cascade and acknowledgement round trips included, stays far below 1 s (the test
+asserts it); the typical cost is about 2 ms. Tails vary from run to run (client, server and
+simulated chargers share one 2017 laptop). The full-station case, the heaviest the brief's
+station allows (two acknowledgements before the increase), stays under 0.4 s at worst. With real
+chargers, network latency would add to these figures.
+
+- **P1, the brief's requirement** (< 1 s): the worst case measured is about 0.4 ms, some
+  2,500 times below the budget. P1 measures a **decrease**, the safety-critical direction,
   published at once. Since V3 an increase additionally waits for the decreasing chargers'
   acknowledgement round trip: that delay depends on the chargers, not on the server.
-- **P2**: **5,000–5,500 events/s** with the safety invariant checked on every one of the
+- **P2**: **4,600–4,950 events/s** with the safety invariant checked on every one of the
   4,000 responses, and every event found in `/events`. A real station sees a few events per
   second: this is headroom, not a target. Each response carries the full station state,
   which is part of this cost.
 - **Across versions**: the water-filling (V2, a sort, O(n log n)) made the allocation about
   5 times slower than V1's equal share (250 µs → 1.3 ms at 10,000 sessions), and the V3
   barrier adds a pass over the sessions; yet end-to-end figures barely move (P1 max: V1
-  444–582 µs, V2 408–513 µs, V3 404–642 µs; P2: 5,300–5,900, 5,600–5,900, 5,000–5,500 events/s).
+  444–582 µs, V2 408–513 µs, V3 404–642 µs, V4 325–385 µs; P2: 5,300–5,900, 5,600–5,900,
+  5,000–5,500, 4,600–4,950 events/s; V4 responses also carry the BESS block).
   Computation is never the bottleneck, the network is.
 
 ## Allocation metrics: V1 → V2 → V3

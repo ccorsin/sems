@@ -1020,3 +1020,33 @@ S23–S25.
 - README: a "Battery storage (BESS)" section (rules, interface, why no acknowledgement,
   assumptions), API and `/status` fields, OPS view, scenarios S23–S25, metrics, limitations,
   roadmap (V4 ✅).
+
+## Step 20 — Critical review: decisions and known risks (2026-10-21)
+
+All tests rerun inside Docker (28 unit tests, 25 scenarios, randomized, push) and performance
+remeasured (P1 max 325–385 µs, P2 4,600–4,950 events/s).
+
+- **Panic while holding the lock: deliberate fail-safe**, documented with its reasoning (a broken
+  invariant must not keep granting power; chargers keep their last safe setpoints). Rollback per
+  event is the documented evolution.
+- **Stale SoC: known weakness, assumed.** A proper fix needs a watchdog timer (the system is
+  event-driven); the same watchdog would implement the charger acknowledgement timeout.
+- **Written as risks, not just limitations**: no authentication (spoofed acknowledgement or SoC
+  could affect physical safety), the BESS not measured at the grid connection.
+- **Silent charger** reworded: current behaviour, limitation, next step. Starvation of increases
+  and hysteresis around the SoC floor documented as improvements. Restart: not handled.
+
+## Step 21 — P4: end-to-end latency per event type (2026-10-21)
+
+The < 1 s requirement covers the whole cascade, not the request alone. P4 measures, for connect,
+disconnect, demand down and demand up, with and without cascade, the time from the event until
+every affected charger holds its final setpoint, acknowledgement round trips included, with
+simulated chargers that acknowledge on reception. Typical cost about 2 ms; worst case observed
+268 ms; always far below 1 s (asserted).
+
+A first version failed intermittently: each helper call opened a new HTTP connection, and the
+thousands of connections left in TIME_WAIT exhausted the laptop's TCP ports. P4 now shares one
+client (connection reuse). A test-side fix; the server was not involved.
+- Added a **full-station case** (3 → 4 sessions, both chargers decrease and must acknowledge before
+  the fourth vehicle gets 100 kW) and an "active sessions" column: median about 2 ms, worst case
+  377 ms observed.

@@ -2,18 +2,27 @@
 //!
 //! Run in release mode: `cargo test --release --test perf -- --ignored --nocapture`
 //!
-//! P1 and P2 run client and server on the same machine: figures include the client's own cost
+//! P4 measures, per event type, the time until **every** affected charger has its final setpoint,
+//! acknowledgement round trips included (the brief's < 1 s is about the whole cascade).
+//!
+//! P1, P2 and P4 run client and server on the same machine: figures include the client's own cost
 //! and are upper bounds. Every event response carries the full station state, so P2 also
 //! measures that serialization.
 
 mod common;
-use common::{brief, change_demand, connect, get, kw, next, next_within, settle, start, subscribe};
+use awc::ws::Frame;
+use common::{
+    ack, brief, change_demand, connect, get, kw, next, next_within, settle, start, subscribe,
+};
 use futures_util::future::join_all;
+use futures_util::StreamExt;
 use sems::allocator::{allocate, Demand};
 use sems::model::{Charger, Config, Connector};
 use serde_json::Value;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 
 /// Sorts the samples and prints p50 / p99 / max; returns max.
 fn report(label: &str, mut times: Vec<Duration>) -> Duration {
@@ -146,6 +155,175 @@ fn assert_safe(status: &Value) {
         total <= status["grid_kw"].as_f64().unwrap() + eps,
         "grid overload"
     );
+}
+
+/// A simulated charger: it acknowledges every setpoints message as soon as it receives it, as a
+/// real one would, and forwards the message to the test.
+fn simulated_charger(addr: &str, id: &str) -> mpsc::UnboundedReceiver<Value> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (addr, id) = (addr.to_string(), id.to_string());
+    actix_web::rt::spawn(async move {
+        let mut ws = subscribe(&addr, &id).await;
+        let client = awc::Client::new();
+        while let Some(Ok(Frame::Text(text))) = ws.next().await {
+            let msg: Value = serde_json::from_slice(&text).unwrap();
+            ack(&client, &addr, &msg).await;
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// A session to plug in: (charger, connector, demand in kW).
+type Plug = (&'static str, u32, f64);
+
+/// Waits until a charger receives `want` kW on `connector` (1 s budget).
+async fn until(rx: &mut mpsc::UnboundedReceiver<Value>, connector: u32, want: f64) {
+    loop {
+        let msg = timeout(Duration::from_secs(1), rx.recv()).await;
+        let msg = msg.expect("final setpoint within 1 s").unwrap();
+        if kw(&msg, connector) == want {
+            return;
+        }
+    }
+}
+
+/// Plugs a vehicle in through a shared client (P4 makes thousands of requests: one connection
+/// each would exhaust the machine's TCP ports); returns the session id.
+async fn plug(
+    client: &awc::Client,
+    addr: &str,
+    charger: &str,
+    connector: u32,
+    demand_kw: f64,
+) -> String {
+    let body =
+        serde_json::json!({ "charger": charger, "connector": connector, "demand_kw": demand_kw });
+    let url = format!("http://{addr}/sessions");
+    let mut res = client.post(url).send_json(&body).await.unwrap();
+    assert_eq!(res.status(), 201);
+    let body: Value = res.json().await.unwrap();
+    body["session_id"].as_str().unwrap().to_string()
+}
+
+/// Untimed: waits for every acknowledgement, then drops the messages received so far.
+async fn settled(
+    client: &awc::Client,
+    addr: &str,
+    chargers: &mut [&mut mpsc::UnboundedReceiver<Value>],
+) {
+    loop {
+        let url = format!("http://{addr}/status");
+        let status: Value = client.get(url).send().await.unwrap().json().await.unwrap();
+        if status["pending_acks"].as_array().unwrap().is_empty() {
+            break;
+        }
+        actix_web::rt::time::sleep(Duration::from_millis(1)).await;
+    }
+    actix_web::rt::time::sleep(Duration::from_millis(5)).await;
+    for rx in chargers.iter_mut() {
+        while rx.try_recv().is_ok() {}
+    }
+}
+
+/// P4 — end-to-end latency per event type, from the event until every affected charger holds
+/// its final setpoint. Simulated chargers acknowledge at once; "cascade" cases include the
+/// decrease, its acknowledgement and the increase it releases. Station: the brief's; A on CP1,
+/// B on CP2.
+#[actix_web::test]
+#[ignore]
+async fn p4_end_to_end_cascade_latency() {
+    const RUNS: usize = 200;
+    let addr = start(&brief());
+    let (mut cp1, mut cp2) = (
+        simulated_charger(&addr, "CP1"),
+        simulated_charger(&addr, "CP2"),
+    );
+    let client = awc::Client::new();
+    let end = |id: String| {
+        let url = format!("http://{addr}/sessions/{id}");
+        client.delete(url).send()
+    };
+    let mut table = Vec::new();
+
+    // Sessions already charging before the timed event.
+    let a: Plug = ("CP1", 1, 300.0);
+    let b: Plug = ("CP2", 1, 300.0);
+    let cases: [(&str, &[Plug]); 7] = [
+        ("connect", &[]),
+        ("connect cascade", &[a]),
+        ("disconnect", &[a]),
+        ("disconnect casc.", &[a, b]),
+        ("decrease casc.", &[a, b]),
+        ("increase casc.", &[("CP1", 1, 50.0), b]),
+        ("full station", &[a, ("CP1", 2, 300.0), b]),
+    ];
+    for (case, (label, before)) in cases.iter().enumerate() {
+        let mut times = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let mut ids = Vec::new();
+            for (charger, connector, kw) in before.iter() {
+                ids.push(plug(&client, &addr, charger, *connector, *kw).await);
+            }
+            settled(&client, &addr, &mut [&mut cp1, &mut cp2]).await;
+
+            let start = Instant::now();
+            match case {
+                0 => {
+                    ids.push(plug(&client, &addr, "CP1", 1, 300.0).await);
+                    until(&mut cp1, 1, 300.0).await;
+                }
+                1 => {
+                    ids.push(plug(&client, &addr, "CP2", 1, 300.0).await);
+                    until(&mut cp2, 1, 200.0).await;
+                }
+                2 => {
+                    end(ids.remove(0)).await.unwrap();
+                    until(&mut cp1, 1, 0.0).await;
+                }
+                3 => {
+                    end(ids.remove(0)).await.unwrap();
+                    until(&mut cp2, 1, 300.0).await;
+                }
+                4 => {
+                    change_demand(&client, &addr, &ids[0], 50.0).await;
+                    until(&mut cp2, 1, 300.0).await;
+                }
+                5 => {
+                    change_demand(&client, &addr, &ids[0], 300.0).await;
+                    until(&mut cp1, 1, 200.0).await;
+                }
+                // Fourth session: CP1 and CP2 both decrease and must both acknowledge before
+                // D gets its 100 kW.
+                _ => {
+                    ids.push(plug(&client, &addr, "CP2", 2, 300.0).await);
+                    until(&mut cp2, 2, 100.0).await;
+                }
+            }
+            times.push(start.elapsed());
+
+            for id in ids {
+                end(id).await.unwrap();
+            }
+            settled(&client, &addr, &mut [&mut cp1, &mut cp2]).await;
+        }
+        table.push((*label, times));
+    }
+
+    println!("\nP4 end-to-end latency until every affected charger is set ({RUNS} runs each)");
+    println!(
+        "{:>16} | {:>10} | {:>10} | {:>10}",
+        "event", "p50", "p99", "max"
+    );
+    for (label, times) in table {
+        let max = report(label, times);
+        assert!(
+            max < Duration::from_secs(1),
+            "{label}: brief requirement < 1 s"
+        );
+    }
 }
 
 /// P3 — allocation time vs number of sessions (2 connectors per charger, all busy).
