@@ -1054,3 +1054,13 @@ client (connection reuse). A test-side fix; the server was not involved.
   and the rest of the cascade. Historical P1 maxima: V1 444–582 µs, V2 408–513 µs, V3 404–642 µs,
   V4 325–385 µs. Kept: P2 (the only concurrency test, safety invariant under load) and P3
   (allocator scaling).
+
+## Step 22 — Atomicity documented, by construction (2026-10-21)
+
+The single `Mutex<Station>` is required: actix-web runs one worker per core, and the global
+invariant "Σ ≤ grid" needs each event in one locked section. `std::sync::Mutex` fits:
+microsecond sections, never held across an `.await`. Rust rules out data races, not a critical
+section split in two: atomicity comes from the design (one locked section per event, readers on
+the same lock, validate before mutating). A dedicated concurrency test was written, then removed
+for simplicity: the property is documented as a checked property, covered by S11, the history
+property, the randomized test and the burst test P2.

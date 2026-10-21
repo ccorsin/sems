@@ -104,7 +104,27 @@ dev machine: P2 ≈ 2,500 events/s); the figures below were measured natively.
   A charger is told its new setpoint when *another* charger's event changes it, is not
   disturbed when it does not, and an increase arrives only once the decreasing charger has
   acknowledged.
+- **Atomicity** (by construction, not a separate test): see below.
 - **Performance** (`tests/perf.rs`): ignored by default, run in release mode.
+
+**Atomicity.** Every accepted event is applied as one indivisible change, never visible
+half-applied, and a rejected one leaves no trace:
+
+- *One locked section per event.* actix-web runs one worker per core, so requests are processed
+  in parallel; the whole station sits behind a single `Mutex`, and each event — validation,
+  application, reallocation, setpoint publication, history record, response — runs inside one
+  locked section. Readers (`/status`, `/events`) take the same lock. Rust rules out data races at
+  compile time, but not a critical section split in two: logical atomicity comes from this
+  design, which is why there is a single lock (the "Σ ≤ grid" invariant is global).
+- *Validate, then mutate.* Every check (unknown charger or session, busy connector, invalid
+  demand or SoC, version never sent) happens before any change; only the model's single event
+  path modifies the state and appends to the history.
+- *Covered by:* S11 (state untouched by seven rejected requests), the history property (a
+  rejected request adds no entry, checked after every step of every scenario), the randomized
+  test (hundreds of rejections predicted by the shadow model), and the burst test P2 (8 parallel
+  clients: every response safe, every event recorded once).
+- *Exception:* a panic in the middle of an event could leave a partial state; the lock is then
+  poisoned and the service stops rather than serve it (deliberate fail-safe, see known risks).
 
 ### Scenarios
 
