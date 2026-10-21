@@ -2,6 +2,7 @@
 //! randomized test. They hold whatever the allocation policy: no expected value is hard-coded.
 
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Tolerance when comparing kW values: 1 W.
 pub const EPS: f64 = 0.001;
@@ -125,6 +126,11 @@ pub fn check_consistency(status: &Value) -> Result<(), String> {
             num(&charger["unserved_kw"]),
             charger_unserved,
         )?;
+        close(
+            "charger available_kw",
+            num(&charger["available_kw"]),
+            num(&charger["max_kw"]) - charger_allocated,
+        )?;
         allocated += charger_allocated;
         unserved += charger_unserved;
     }
@@ -156,4 +162,63 @@ pub fn optimum_kw(status: &Value) -> f64 {
         })
         .fold(0.0, |a, b| a + b); // Not `sum()`: an empty f64 sum is -0.0, printed "-0.0".
     deliverable.min(num(&status["grid_kw"]))
+}
+
+/// Setpoint (kW) of every connector, keyed `"charger/connector"` (0 when free).
+pub fn setpoints_of(status: &Value) -> HashMap<String, f64> {
+    let mut setpoints = HashMap::new();
+    for charger in status["chargers"].as_array().unwrap() {
+        for connector in charger["connectors"].as_array().unwrap() {
+            let key = format!("{}/{}", charger["id"], connector["id"]);
+            let kw = connector["session"]["setpoint_kw"].as_f64().unwrap_or(0.0);
+            setpoints.insert(key, kw);
+        }
+    }
+    setpoints
+}
+
+/// Transition safety ("decrease before increase"): even if every charger still applied the
+/// larger of its old and new setpoint, no charger and not the grid would be exceeded.
+/// A session that ended counts for nothing: an unplugged vehicle draws no power.
+/// Returns the grid excess of that worst case (≤ 0 when safe).
+pub fn check_transition(before: &Value, after: &Value) -> Result<f64, String> {
+    // "charger/connector" → (session id, setpoint).
+    let sessions = |status: &Value| -> HashMap<String, (Value, f64)> {
+        let mut map = HashMap::new();
+        for charger in status["chargers"].as_array().unwrap() {
+            for connector in charger["connectors"].as_array().unwrap() {
+                let session = &connector["session"];
+                let key = format!("{}/{}", charger["id"], connector["id"]);
+                let kw = session["setpoint_kw"].as_f64().unwrap_or(0.0);
+                map.insert(key, (session["id"].clone(), kw));
+            }
+        }
+        map
+    };
+    let (old, new) = (sessions(before), sessions(after));
+    let worst = |key: &String| match (old.get(key), &new[key]) {
+        (Some((old_id, old_kw)), (id, kw)) if old_id == id => old_kw.max(*kw),
+        (_, (_, kw)) => *kw,
+    };
+    let mut station = 0.0;
+    for charger in after["chargers"].as_array().unwrap() {
+        let prefix = format!("{}/", charger["id"]);
+        let total: f64 = new
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .map(worst)
+            .sum();
+        if total > num(&charger["max_kw"]) + EPS {
+            return Err(format!(
+                "transition: charger {} could draw {total} kW",
+                charger["id"]
+            ));
+        }
+        station += total;
+    }
+    let excess = station - num(&after["grid_kw"]);
+    match excess > EPS {
+        true => Err(format!("transition: the grid could see {station} kW")),
+        false => Ok(excess),
+    }
 }

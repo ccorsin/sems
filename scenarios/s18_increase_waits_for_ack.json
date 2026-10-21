@@ -1,0 +1,15 @@
+{
+  "name": "S18 increase waits for the acknowledgement",
+  "why": "Decrease before increase: when B arrives, A's decrease is published at once but B's increase is held until CP1 acknowledges, so the grid is never exceeded even if B ramps up before A has reduced. A departure only frees power: the remaining increase is granted at once.",
+  "config": "config/station.json",
+  "acks": "manual",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 300 }, "pending": [] } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 200, "B": 0 }, "targets": { "B": 200 },
+                  "statuses": { "B": "suspended_evse" }, "pending": ["CP1"] } },
+    { "ack": "CP1", "expect": { "setpoints": { "A": 200, "B": 200 }, "pending": [] } },
+    { "disconnect": "A", "expect": { "setpoints": { "B": 300 }, "pending": [] } }
+  ]
+}

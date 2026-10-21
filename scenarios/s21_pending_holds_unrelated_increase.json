@@ -1,0 +1,17 @@
+{
+  "name": "S21 pending decrease holds an unrelated increase",
+  "why": "The acknowledgement barrier is station-wide and all or nothing: while CP1's decrease is unacknowledged, B's increase on CP2 is held even though it would already fit within the grid. Safe and simple, at the cost of a short delay.",
+  "config": "config/station.json",
+  "acks": "manual",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 300 }, "pending": [] } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 50 },
+      "expect": { "setpoints": { "A": 300, "B": 50 }, "pending": [] } },
+    { "change": { "session": "A", "demand_kw": 100 },
+      "expect": { "setpoints": { "A": 100, "B": 50 }, "pending": ["CP1"] } },
+    { "change": { "session": "B", "demand_kw": 200 },
+      "expect": { "setpoints": { "A": 100, "B": 50 }, "targets": { "B": 200 }, "pending": ["CP1"] } },
+    { "ack": "CP1", "expect": { "setpoints": { "A": 100, "B": 200 }, "pending": [] } }
+  ]
+}

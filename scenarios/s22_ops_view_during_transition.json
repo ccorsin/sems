@@ -1,0 +1,17 @@
+{
+  "name": "S22 OPS view during a pending acknowledgement",
+  "why": "The state exposed to OPS must reflect reality at every instant, including a partial transition: while CP1's acknowledgement is pending, B shows suspended_evse with its target, the blocking charger is listed, and totals count only what is granted.",
+  "config": "config/station.json",
+  "acks": "manual",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 },
+      "expect": { "allocated_kw": 300, "available_kw": 100, "unserved_kw": 0, "pending": [] } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 200, "B": 0 }, "targets": { "A": 200, "B": 200 },
+                  "statuses": { "A": "charging", "B": "suspended_evse" }, "pending": ["CP1"],
+                  "allocated_kw": 200, "available_kw": 200, "unserved_kw": 400 } },
+    { "ack": "CP1",
+      "expect": { "setpoints": { "A": 200, "B": 200 }, "statuses": { "A": "charging", "B": "charging" },
+                  "pending": [], "allocated_kw": 400, "available_kw": 0, "unserved_kw": 200 } }
+  ]
+}

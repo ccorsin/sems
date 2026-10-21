@@ -1,11 +1,18 @@
 //! Scenario runner: replays every `scenarios/*.json` file against the API (in memory).
 //!
-//! A scenario is a config plus ordered steps. Each step sends at most one event, then checks
-//! its optional expectations against `GET /status`. After **every** step two invariants are
-//! checked too, without being written in the scenario files:
+//! A scenario is a config plus ordered steps. Each step sends at most one request (a session
+//! event or an acknowledgement), then checks its optional expectations against `GET /status`.
+//! After **every** request, these properties are checked too, without being written in the
+//! scenario files:
 //! - safety: no setpoint above its demand or connector, no charger or grid overload;
-//! - history: an accepted event adds exactly one `/events` entry (right kind, right session,
-//!   resulting allocation equal to `/status`); a rejected event adds none.
+//! - transition: even if chargers still applied their previous setpoints, no overload;
+//! - history: an accepted request adds exactly one `/events` entry (right kind, right session,
+//!   resulting allocation equal to `/status`); a rejected one adds none;
+//! - consistency: `/status` totals and statuses match its sessions.
+//!
+//! Acknowledgements: by default (`"acks": "auto"`) the runner plays perfect chargers that
+//! acknowledge at once, after checking the intermediate state; expectations then describe the
+//! settled station. With `"acks": "manual"`, acknowledgements are explicit `ack` steps.
 //!
 //! Sessions are named by aliases (`"as": "A"`) since the server generates the UUIDs.
 //! An unknown alias maps to a random UUID, to exercise the "unknown session" path.
@@ -16,7 +23,10 @@
 
 mod common;
 use actix_web::{test, App};
-use common::checks::{check_consistency, check_history, check_invariant, num, optimum_kw, EPS};
+use common::checks::{
+    check_consistency, check_history, check_invariant, check_transition, num, optimum_kw,
+    setpoints_of, EPS,
+};
 use sems::{api, model::Config, model::Station};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -32,10 +42,12 @@ struct Scenario {
     why: String,
     /// Inline config, or a path to a config file (relative to the crate root).
     config: Value,
+    /// `"auto"` (default): chargers acknowledge at once; `"manual"`: explicit `ack` steps.
+    acks: Option<String>,
     steps: Vec<Step>,
 }
 
-/// One step: at most one event, then expectations.
+/// One step: at most one request, then expectations.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Step {
@@ -43,6 +55,7 @@ struct Step {
     change: Option<Change>,
     /// Alias of the session to end.
     disconnect: Option<String>,
+    ack: Option<Ack>,
     #[serde(default)]
     expect: Expect,
 }
@@ -64,16 +77,28 @@ struct Change {
     demand_kw: f64,
 }
 
+/// `"CP1"` acknowledges CP1's latest version; `{"charger": "CP1", "version": 2}` a given one.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Ack {
+    Latest(String),
+    Exact { charger: String, version: u64 },
+}
+
 /// Every field is optional: a scenario only checks what matters to it.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Expect {
-    /// HTTP code of the event; when absent, any 2xx is required.
+    /// HTTP code of the request; when absent, any 2xx is required.
     http: Option<u16>,
-    /// Setpoint (kW) per session alias.
+    /// Granted setpoint (kW) per session alias.
     setpoints: Option<HashMap<String, f64>>,
+    /// Target (kW) per session alias: what the allocator would give.
+    targets: Option<HashMap<String, f64>>,
     /// Connector status per session alias (the connector the alias was plugged into).
     statuses: Option<HashMap<String, String>>,
+    /// Chargers whose acknowledgement is awaited.
+    pending: Option<Vec<String>>,
     allocated_kw: Option<f64>,
     available_kw: Option<f64>,
     unserved_kw: Option<f64>,
@@ -118,10 +143,30 @@ async fn scenarios() {
     );
 }
 
+/// A request to send, with the history `kind` it produces if accepted.
+type Request = (test::TestRequest, &'static str);
+
+fn ack_request(charger: &str, version: u64) -> Request {
+    let uri = format!("/chargers/{charger}/ack");
+    let request = test::TestRequest::post()
+        .uri(&uri)
+        .set_json(json!({ "version": version }));
+    (request, "ack")
+}
+
 async fn run(scenario: &Scenario) -> Result<Metrics, String> {
     let config_json = match &scenario.config {
         Value::String(path) => fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
         inline => inline.to_string(),
+    };
+    let auto_acks = match scenario.acks.as_deref() {
+        None | Some("auto") => true,
+        Some("manual") => false,
+        Some(other) => {
+            return Err(format!(
+                "acks must be \"auto\" or \"manual\", not {other:?}"
+            ))
+        }
     };
     let station = Station::new(Config::from_json(&config_json)?, 0);
     let app = test::init_service(
@@ -130,6 +175,7 @@ async fn run(scenario: &Scenario) -> Result<Metrics, String> {
             .configure(api::configure),
     )
     .await;
+    let get = |uri: &str| test::TestRequest::get().uri(uri).to_request();
 
     // Alias → (session id, charger, connector).
     let mut sessions: HashMap<String, (Uuid, String, u32)> = HashMap::new();
@@ -139,73 +185,105 @@ async fn run(scenario: &Scenario) -> Result<Metrics, String> {
 
     let mut last_seq = 0;
     let mut metrics = Metrics::default();
-    let mut previous = HashMap::new(); // Setpoints after the previous step.
+    let mut status: Value = test::call_and_read_body_json(&app, get("/status")).await;
+    let mut previous = setpoints_of(&status); // Setpoints after the previous step.
     for (i, step) in scenario.steps.iter().enumerate() {
         let at = |e: String| format!("step {}: {e}", i + 1);
 
-        // The request, and the history `kind` it produces if accepted.
-        let request = match (&step.connect, &step.change, &step.disconnect) {
-            (Some(c), None, None) => Some((
-                test::TestRequest::post().uri("/sessions").set_json(json!({
-                    "charger": c.charger, "connector": c.connector, "demand_kw": c.demand_kw
-                })),
-                "session_started",
-            )),
-            (None, Some(c), None) => Some((
-                test::TestRequest::put()
-                    .uri(&format!("/sessions/{}", id_of(&sessions, &c.session)))
-                    .set_json(json!({ "demand_kw": c.demand_kw })),
-                "demand_changed",
-            )),
-            (None, None, Some(alias)) => Some((
-                test::TestRequest::delete().uri(&format!("/sessions/{}", id_of(&sessions, alias))),
-                "session_ended",
-            )),
-            (None, None, None) => None,
-            _ => return Err(at("a step holds at most one event".into())),
-        };
+        let request: Option<Request> =
+            match (&step.connect, &step.change, &step.disconnect, &step.ack) {
+                (Some(c), None, None, None) => Some((
+                    test::TestRequest::post().uri("/sessions").set_json(json!({
+                        "charger": c.charger, "connector": c.connector, "demand_kw": c.demand_kw
+                    })),
+                    "session_started",
+                )),
+                (None, Some(c), None, None) => Some((
+                    test::TestRequest::put()
+                        .uri(&format!("/sessions/{}", id_of(&sessions, &c.session)))
+                        .set_json(json!({ "demand_kw": c.demand_kw })),
+                    "demand_changed",
+                )),
+                (None, None, Some(alias), None) => Some((
+                    test::TestRequest::delete()
+                        .uri(&format!("/sessions/{}", id_of(&sessions, alias))),
+                    "session_ended",
+                )),
+                (None, None, None, Some(Ack::Exact { charger, version })) => {
+                    Some(ack_request(charger, *version))
+                }
+                (None, None, None, Some(Ack::Latest(charger))) => {
+                    let version = status["chargers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|c| c["id"] == charger.as_str())
+                        .map_or(0, |c| c["version"].as_u64().unwrap_or(0));
+                    Some(ack_request(charger, version))
+                }
+                (None, None, None, None) => None,
+                _ => return Err(at("a step holds at most one request".into())),
+            };
 
-        // Kind and session id of the accepted event, if any.
-        let mut accepted = None;
-        if let Some((request, kind)) = request {
-            let res = test::call_service(&app, request.to_request()).await;
-            let code = res.status();
-            let body: Value = test::read_body_json(res).await;
-            match step.expect.http {
-                Some(expected) if code.as_u16() != expected => {
-                    return Err(at(format!("expected HTTP {expected}, got {code}: {body}")))
-                }
-                None if !code.is_success() => {
-                    return Err(at(format!("unexpected HTTP {code}: {body}")))
-                }
-                _ => {}
+        // The step's request first, then (auto mode) the acknowledgements it calls for. Every
+        // request is followed by the full set of checks, so intermediate states are verified.
+        // `own` marks the step's request, as opposed to an acknowledgement added by auto mode.
+        let mut queue: Vec<(Option<Request>, bool)> = vec![(request, true)];
+        let mut is_event = false;
+        let mut rounds = 0;
+        while let Some((item, own)) = queue.pop() {
+            rounds += 1;
+            if rounds > 100 {
+                return Err(at("acknowledgements never settle the station".into()));
             }
-            if let (Some(c), true) = (&step.connect, code.is_success()) {
-                let id = body["session_id"]
-                    .as_str()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or(at("no session_id".into()))?;
-                sessions.insert(c.alias.clone(), (id, c.charger.clone(), c.connector));
+            let mut accepted = None;
+            if let Some((request, kind)) = item {
+                let res = test::call_service(&app, request.to_request()).await;
+                let code = res.status();
+                let body: Value = test::read_body_json(res).await;
+                let expected = if own { step.expect.http } else { Some(200) };
+                match expected {
+                    Some(expected) if code.as_u16() != expected => {
+                        return Err(at(format!("expected HTTP {expected}, got {code}: {body}")))
+                    }
+                    None if !code.is_success() => {
+                        return Err(at(format!("unexpected HTTP {code}: {body}")))
+                    }
+                    _ => {}
+                }
+                if let (Some(c), true, true) = (&step.connect, own, code.is_success()) {
+                    let id = body["session_id"]
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or(at("no session_id".into()))?;
+                    sessions.insert(c.alias.clone(), (id, c.charger.clone(), c.connector));
+                }
+                if code.is_success() {
+                    accepted = Some((kind, body["session_id"].clone()));
+                    is_event |= own;
+                }
             }
-            if code.is_success() {
-                accepted = Some((kind, body["session_id"].clone()));
+
+            let before = status;
+            status = test::call_and_read_body_json(&app, get("/status")).await;
+            let latest: Vec<Value> =
+                test::call_and_read_body_json(&app, get("/events?limit=1")).await;
+            check_invariant(&status).map_err(at)?;
+            check_consistency(&status).map_err(at)?;
+            let excess = check_transition(&before, &status).map_err(at)?;
+            metrics.overshoot_kw = metrics.overshoot_kw.max(excess);
+            let was_accepted = accepted.is_some();
+            check_history(&mut last_seq, accepted, &latest, &status).map_err(at)?;
+
+            if auto_acks && was_accepted && queue.is_empty() {
+                for pending in status["pending_acks"].as_array().unwrap() {
+                    let charger = pending["charger"].as_str().unwrap();
+                    let version = pending["version"].as_u64().unwrap();
+                    queue.push((Some(ack_request(charger, version)), false));
+                }
             }
         }
 
-        let status: Value = test::call_and_read_body_json(
-            &app,
-            test::TestRequest::get().uri("/status").to_request(),
-        )
-        .await;
-        let latest: Vec<Value> = test::call_and_read_body_json(
-            &app,
-            test::TestRequest::get().uri("/events?limit=1").to_request(),
-        )
-        .await;
-        check_invariant(&status).map_err(at)?;
-        check_consistency(&status).map_err(at)?;
-        let is_event = accepted.is_some();
-        check_history(&mut last_seq, accepted, &latest, &status).map_err(at)?;
         check_expect(&step.expect, &status, &sessions).map_err(at)?;
         previous = metrics.observe(&status, &previous, is_event);
     }
@@ -229,7 +307,8 @@ struct Metrics {
     /// Setpoints changed, summed over accepted events.
     churn: usize,
     events: usize,
-    /// Worst case if every charger applied the larger of its old and new setpoint (kW, max).
+    /// Worst grid excess if every charger applied the larger of its old and new setpoint,
+    /// over every transition, intermediate ones included (kW, max). Since V3: always 0.
     overshoot_kw: f64,
 }
 
@@ -259,7 +338,6 @@ impl Metrics {
         previous: &HashMap<String, f64>,
         is_event: bool,
     ) -> HashMap<String, f64> {
-        let grid = num(&status["grid_kw"]);
         let allocated = num(&status["allocated_kw"]);
         let optimum = optimum_kw(status);
         let (mut demand, mut ratios) = (0.0, Vec::new());
@@ -303,10 +381,8 @@ impl Metrics {
             let changed = setpoints
                 .iter()
                 .filter(|(k, &new)| (new - old(k)).abs() > EPS);
-            let peak: f64 = setpoints.iter().map(|(k, &new)| new.max(old(k))).sum();
             self.churn += changed.count();
             self.events += 1;
-            self.overshoot_kw = self.overshoot_kw.max(peak - grid);
         }
         setpoints
     }
@@ -385,16 +461,27 @@ fn check_expect(
             })
             .ok_or(format!("connector of {alias} not found"))
     };
-    for (alias, want) in expect.setpoints.iter().flatten() {
-        let connector = connector_of(alias)?;
-        if connector["session"]["id"].as_str() != Some(sessions[alias].0.to_string().as_str()) {
-            return Err(format!("session {alias} is not active"));
+    for (field, expected) in [("setpoint", &expect.setpoints), ("target", &expect.targets)] {
+        for (alias, want) in expected.iter().flatten() {
+            let connector = connector_of(alias)?;
+            let id = sessions[alias].0.to_string();
+            if connector["session"]["id"].as_str() != Some(id.as_str()) {
+                return Err(format!("session {alias} is not active"));
+            }
+            let got = num(&connector["session"][format!("{field}_kw")]);
+            close(&format!("{field} of {alias}"), got, *want)?;
         }
-        close(
-            &format!("setpoint of {alias}"),
-            num(&connector["session"]["setpoint_kw"]),
-            *want,
-        )?;
+    }
+    if let Some(want) = &expect.pending {
+        let got: Vec<&str> = status["pending_acks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["charger"].as_str().unwrap())
+            .collect();
+        if got != *want {
+            return Err(format!("pending acks: expected {want:?}, got {got:?}"));
+        }
     }
     for (alias, want) in expect.statuses.iter().flatten() {
         let got = &connector_of(alias)?["status"];

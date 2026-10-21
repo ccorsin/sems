@@ -1,0 +1,15 @@
+{
+  "name": "S20 silent charger freezes increases",
+  "why": "Known limitation, safety first: a charger that never acknowledges its decrease (failure, lost link) holds every increase on the station, including its own vehicle's, and OPS sees it in pending_acks. A timeout marking it as failed and excluding it from the allocation is the documented next step.",
+  "config": "config/station.json",
+  "acks": "manual",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 200, "B": 0 }, "pending": ["CP1"] } },
+    { "change": { "session": "B", "demand_kw": 100 },
+      "expect": { "setpoints": { "A": 200, "B": 0 }, "targets": { "A": 300, "B": 100 }, "pending": ["CP1"] } },
+    { "disconnect": "B",
+      "expect": { "setpoints": { "A": 200 }, "targets": { "A": 300 }, "pending": ["CP1"] } }
+  ]
+}

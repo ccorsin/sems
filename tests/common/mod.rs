@@ -93,6 +93,26 @@ pub async fn change_demand(
     )
 }
 
+/// A charger acknowledges the version of a setpoints message it received (expects 200).
+pub async fn ack(client: &awc::Client, addr: &str, msg: &Value) {
+    let charger = msg["charger"].as_str().unwrap();
+    let res = client
+        .post(format!("http://{addr}/chargers/{charger}/ack"))
+        .send_json(&json!({ "version": msg["version"] }))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+}
+
+/// Every awaited charger acknowledges its pending version, as instant chargers would.
+pub async fn settle(addr: &str) {
+    let client = awc::Client::new();
+    let (_, status) = get(format!("http://{addr}/status")).await;
+    for pending in status["pending_acks"].as_array().unwrap() {
+        ack(&client, addr, pending).await;
+    }
+}
+
 pub async fn get(url: String) -> (u16, Value) {
     let mut res = awc::Client::new().get(url).send().await.unwrap();
     (
