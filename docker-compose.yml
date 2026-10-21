@@ -1,0 +1,16 @@
+# docker compose up --build        → the server on http://localhost:8080
+# docker compose run --rm test     → unit tests + scenarios
+services:
+  sems:
+    build: .
+    ports:
+      - "8080:8080"
+    # Another station: mount its config instead of the brief's one.
+    # volumes:
+    #   - ./my-station.json:/config/station.json:ro
+
+  test:
+    build:
+      context: .
+      target: tester
+    profiles: ["test"] # not started by `docker compose up`
