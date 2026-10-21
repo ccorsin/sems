@@ -66,7 +66,40 @@ curl -X POST localhost:8080/chargers/CP1/ack -H 'content-type: application/json'
 curl localhost:8080/status
 ```
 
-The server logs one line per accepted event on stdout (`docker compose logs -f sems`).
+Replace `<id-A>` with the `session_id` returned by the first request. The server logs one line
+per accepted event on stdout (`docker compose logs -f sems`); this sequence tells the whole
+story, from A alone to B released by CP1's acknowledgements:
+
+```
+session_started session=8c45… setpoint=300.0kW station_allocated=300.0kW pending_acks=[]
+session_started session=878b… setpoint=0.0kW station_allocated=200.0kW pending_acks=["CP1"]
+ack charger=CP1 version=2 station_allocated=400.0kW pending_acks=[]
+demand_changed session=8c45… setpoint=50.0kW station_allocated=250.0kW pending_acks=["CP1"]
+session_ended session=8c45… setpoint=0.0kW station_allocated=200.0kW pending_acks=["CP1"]
+ack charger=CP1 version=4 station_allocated=300.0kW pending_acks=[]
+```
+
+`GET /status` then returns (abridged: CP1 and the free connectors left out):
+
+```json
+{ "grid_kw": 400.0, "capacity_kw": 400.0, "allocated_kw": 300.0, "available_kw": 100.0,
+  "unserved_kw": 0.0, "grid_import_kw": 300.0, "pending_acks": [], "bess": null,
+  "chargers": [
+    { "id": "CP2", "max_kw": 300.0, "allocated_kw": 300.0, "available_kw": 0.0, "unserved_kw": 0.0,
+      "version": 6, "online": false, "online_since_ms": 1792592812463,
+      "connectors": [
+        { "id": 1, "type": "CCS", "max_kw": 300.0, "status": "charging", "status_since_ms": 1792592812709,
+          "session": { "id": "878b…", "started_at_ms": 1792592812566,
+                       "demand_kw": 300.0, "setpoint_kw": 300.0, "target_kw": 300.0 } } ] } ] }
+```
+
+With a BESS (`config/station_bess.json`), `bess` is an object. Its `soc` stays `null` until the
+BMS reports one: the file configures the battery's size, never its charge.
+
+```json
+"bess": { "capacity_kwh": 200.0, "max_kw": 150.0, "soc": 0.6, "mode": "charging",
+          "power_kw": 150.0, "boost_kw": 150.0, "energy_above_floor_kwh": 100.0 }
+```
 
 ## Station configuration
 
@@ -117,6 +150,8 @@ without BESS; the randomized test generates hundreds of random ones.
 With Docker only:
 
 ```bash
+# Build (or rebuild after a code change: `run` reuses the last image)
+docker compose build test
 # All tests: unit, scenarios, randomized, push
 docker compose run --rm test
 # Scenarios one by one, with their metrics and the summary table
@@ -131,8 +166,6 @@ docker compose run --rm test cargo test --release --test perf -- --ignored --noc
 Natively (stable Rust): the same commands without `docker compose run --rm test`, e.g.
 `cargo test` or `cargo test --test scenarios -- --nocapture`.
 
-Performance figures measured inside Docker on macOS include the Docker VM's overhead (on the
-dev machine: P2 ≈ 2,500 events/s); the figures below were measured natively.
 
 - **Unit tests** (`src/*.rs`): configuration validation, session lifecycle and statuses,
   allocation algorithm, malformed requests.
@@ -249,7 +282,7 @@ initiates the exchange?*
 - New setpoints are initiated by **the server**: when B plugs into CP2, CP1 must lower A's power
   although CP1 sent nothing. Plain HTTP cannot speak first (a server only answers); without a
   push channel, CP1 would have to poll and latency would depend on the polling interval. The
-  WebSocket is that push channel (P4 below: about 2 ms from B's event to the end of the cascade).
+  WebSocket is that push channel (P4 below: about 3 ms from B's event to the end of the cascade).
 - The acknowledgement goes **from the charger to the server**, so it is an HTTP request like any
   other charger event, even though the setpoint it acknowledges came over the WebSocket.
 - In a real deployment this would converge on **a single bidirectional WebSocket per charger**,
@@ -305,7 +338,8 @@ Without it, nothing changes. With it, three rules, recomputed on every event:
 | **One flow at a time** | With V the vehicles' granted total: **discharging** `V − grid` if V > grid; else **charging** `min(grid − V, max_kw)` while not full (vehicles first: the BESS only takes what they leave); else **idle** (no flow: power 0). |
 | **Grid connection** | The import is `V − discharge + charge`: always between 0 and the grid limit, never an overload, never an export. |
 
-The BMS reports the SoC: `POST /bess {"soc": 0.42}` (0 to 1). The BESS speaks first, so it is an
+The BMS (Battery Management System, the battery's own controller) reports the SoC:
+`POST /bess {"soc": 0.42}` (0 to 1). Until its first report the SoC is unknown (`null`): no boost. The BESS speaks first, so it is an
 HTTP request, like a charger event; it may change the capacity, hence the allocation, and is
 recorded in `/events` (kind `bess_soc`). `GET /status` adds `capacity_kw`, `grid_import_kw` and a
 `bess` block: `soc`, `mode` (`charging`, `discharging`, `idle`), `power_kw`, `boost_kw`,
@@ -409,8 +443,9 @@ both facts side by side.
 
 ### History (OPS diagnostics)
 
-`GET /events` returns the latest accepted events, oldest first: `limit` (default 100) and an
-optional `session` filter. Each entry holds the event **and the allocation that resulted from
+`GET /events` returns the latest accepted events of the whole station, oldest first;
+`limit` (default 100) and `session` (one session's events only) are optional. History lives in
+memory: it starts empty at each server start. Each entry holds the event **and the allocation that resulted from
 it**, so that a setpoint can be explained afterwards:
 
 ```json
@@ -525,16 +560,17 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
 
 ## Performance
 
-`cargo test --release --test perf -- --ignored --nocapture --test-threads=1`. Release build,
-natively on a 2017 MacBook Pro (i7-7700HQ); ranges over 3 runs. Client and server share the
-machine, so these are upper bounds; max values vary with OS scheduling.
+`docker compose run --rm test cargo test --release --test perf -- --ignored --nocapture --test-threads=1`.
+Release build, measured **inside the Docker container** (the same command anyone can run; Docker
+Desktop VM with 4 CPUs), ranges over 3 runs. Client, server and simulated chargers share the
+container, so these are upper bounds; max values vary with scheduling.
 
 | Test | What | p50 | p99 | max |
 |---|---|---|---|---|
-| **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.2 ms | 3.6–4.4 ms | 7.2–23 ms |
-| **P3** | Allocation alone, 4 sessions | 1.0 µs | 6–12 µs | ≤ 61 µs |
-| | Allocation alone, 100 sessions | 13 µs | 17–37 µs | ≤ 72 µs |
-| | Allocation alone, 10,000 sessions | 1.3–1.4 ms | 2.0–2.2 ms | ≤ 14 ms |
+| **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.5–2.2 ms | 6.0–7.0 ms | 9.1–20 ms |
+| **P3** | Allocation alone, 4 sessions | 0.4 µs | 0.7–1.1 µs | ≤ 238 µs |
+| | Allocation alone, 100 sessions | 6.8–6.9 µs | 18–31 µs | ≤ 160 µs |
+| | Allocation alone, 10,000 sessions | 0.71–0.73 ms | 0.97–1.6 ms | ≤ 13 ms |
 
 **P4 — the brief's requirement, end to end.** What counts is the time from an event until
 **every affected charger holds its final setpoint**, the whole cascade included. Simulated
@@ -544,30 +580,26 @@ and the increase it releases. 200 runs per case, ranges over 3 runs:
 
 | Event | Active sessions | Ends when | p50 | p99 | max |
 |---|---|---|---|---|---|
-| Connect, no cascade | 0 → 1 | A receives 300 kW | 1.1–1.9 ms | 2.0–3.9 ms | 2.1–149 ms |
-| Connect, **cascade** | 1 → 2 | B plugs in: A receives 200 kW, acknowledges, then **B receives 200 kW** | 1.7–3.3 ms | 2.8–98 ms | 5.6–125 ms |
-| Disconnect, no cascade | 1 → 0 | A leaves: CP1 receives 0 kW | 1.1–1.7 ms | 2.2–8.6 ms | 10–58 ms |
-| Disconnect, **cascade** | 2 → 1 | A leaves: **B receives 300 kW** | 1.1–2.1 ms | 2.0–160 ms | 2.0–197 ms |
-| Demand down, **cascade** | 2 | A drops to 50 kW, acknowledges, then **B receives 300 kW** | 1.7–2.3 ms | 2.5–167 ms | 2.6–285 ms |
-| Demand up, **cascade** | 2 | A asks 300 kW: B receives 200 kW, acknowledges, then **A receives 200 kW** | 1.7–2.1 ms | 5.4–187 ms | 18–289 ms |
-| **Full station**, cascade on both chargers | 3 → 4 | D plugs into CP2: A, B (CP1) and C (CP2) drop to 100 kW, **both chargers acknowledge**, then **D receives 100 kW** | 1.8–2.0 ms | 7.1–305 ms | 8.2–377 ms |
+| Connect, no cascade | 0 → 1 | A receives 300 kW | 2.0–2.1 ms | 3.0–5.9 ms | 3.1–16 ms |
+| Connect, **cascade** | 1 → 2 | B plugs in: A receives 200 kW, acknowledges, then **B receives 200 kW** | 2.7–2.8 ms | 4.3–8.5 ms | 4.7–12 ms |
+| Disconnect, no cascade | 1 → 0 | A leaves: CP1 receives 0 kW | 1.6–1.8 ms | 2.6–3.3 ms | 2.6–24 ms |
+| Disconnect, **cascade** | 2 → 1 | A leaves: **B receives 300 kW** | 1.9–2.0 ms | 3.0–8.8 ms | 3.0–13 ms |
+| Demand down, **cascade** | 2 | A drops to 50 kW, acknowledges, then **B receives 300 kW** | 2.4 ms | 3.5–4.7 ms | 4.2–5.0 ms |
+| Demand up, **cascade** | 2 | A asks 300 kW: B receives 200 kW, acknowledges, then **A receives 200 kW** | 2.4 ms | 3.3–4.3 ms | 3.4–31 ms |
+| **Full station**, cascade on both chargers | 3 → 4 | D plugs into CP2: A, B (CP1) and C (CP2) drop to 100 kW, **both chargers acknowledge**, then **D receives 100 kW** | 2.7 ms | 4.4–5.2 ms | 7.1–18 ms |
 
 Every case, cascade and acknowledgement round trips included, stays far below 1 s (the test
-asserts it); the typical cost is about 2 ms. Tails vary from run to run (client, server and
-simulated chargers share one 2017 laptop). The full-station case, the heaviest the brief's
-station allows (two acknowledgements before the increase), stays under 0.4 s at worst. With real
-chargers, network latency would add to these figures.
+asserts it): typically about 2–3 ms, 31 ms at worst. The full-station case, the heaviest the
+brief's station allows (two acknowledgements before the increase), is no slower than the others.
+With real chargers, network latency would add to these figures.
 
-- **P2**: **4,600–4,950 events/s** with the safety invariant checked on every one of the
+- **P2**: **2,850–3,600 events/s** with the safety invariant checked on every one of the
   4,000 responses, and every event found in `/events`. A real station sees a few events per
   second: this is headroom, not a target. Each response carries the full station state,
   which is part of this cost.
-- **Across versions**: the water-filling (V2, a sort, O(n log n)) made the allocation about
-  5 times slower than V1's equal share (250 µs → 1.3 ms at 10,000 sessions), and the V3
-  barrier adds a pass over the sessions; yet end-to-end figures barely move (P2: 5,300–5,900,
-  5,600–5,900, 5,000–5,500, 4,600–4,950 events/s from V1 to V4; V4 responses also carry the
-  BESS block).
-  Computation is never the bottleneck, the network is.
+- **Across versions**: the water-filling (V2, a sort, O(n log n)) is slower than V1's equal
+  share, and the V3 barrier adds a pass over the sessions; yet end-to-end throughput barely
+  moved from V1 to V4. Computation is never the bottleneck, the network is.
 
 ## Allocation metrics: V1 → V2 → V3
 

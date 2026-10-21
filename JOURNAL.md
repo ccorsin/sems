@@ -38,9 +38,10 @@ or missing acknowledgements, random BESS states of charge, with a shadow model p
 HTTP code); push tests against
 a real server; performance tests. Every test family was verified against deliberate bugs.
 
-**Figures** (2017 MacBook Pro, native release build): an event on one charger reaches another
-charger's WebSocket in under 0.7 ms (the requirement is 1 s); about 5,000 events/s under a
-concurrent burst with the safety invariant checked on every response.
+**Figures** (release build inside the Docker container): from an event until every affected
+charger holds its final setpoint, acknowledgement cascade included, about 2–3 ms typically and
+31 ms at worst (the requirement is 1 s); about 3,000 events/s under a concurrent burst with the
+safety invariant checked on every response.
 
 **Assumptions.** Power modelled in kW, continuously divisible (no stacks); one server per
 station; a setpoint received is applied at once; state in memory; no authentication. BESS: the
@@ -1074,3 +1075,18 @@ configuration" README section (format, defaults, validation, examples), a second
 `docker-compose.yml` to start any station. Checked in the container: both examples start, an
 invalid file is refused at startup with its message. Also a table of contents at the top of the
 README.
+
+## Step 24 — README checked against the running server; performance measured in Docker (2026-10-21)
+
+Every `curl` of the quick start was replayed against the container: all correct. Added the server
+logs of that sequence (they tell the barrier's story line by line), an abridged real `/status`
+response, the BESS block and why its `soc` is `null` until the BMS reports one, and made explicit
+that `/events` without `session` returns the whole station's history (in memory, empty after a
+restart).
+
+Performance figures are now measured inside the Docker container, the command any reviewer can
+run, instead of natively on the dev machine. Throughput is lower (P2 2,850–3,600 events/s, the
+Docker Desktop VM's cost), latency tails are much tighter (P4 worst case 31 ms instead of 377 ms, over 3 runs):
+every cascade stays far below 1 s. Pitfall found on the way: `docker compose run` reuses the last
+built image, so the first measurement ran stale code; the README now starts with
+`docker compose build test` (`run --build` needs Compose ≥ 2.13).
