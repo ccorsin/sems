@@ -9,6 +9,10 @@
 //!
 //! Sessions are named by aliases (`"as": "A"`) since the server generates the UUIDs.
 //! An unknown alias maps to a random UUID, to exercise the "unknown session" path.
+//!
+//! The runner also measures allocation-quality metrics (waste, efficiency, satisfaction,
+//! fairness, churn, potential transient overshoot), worst case per scenario, and prints a
+//! summary table: the baseline to compare versions of the algorithm against.
 
 use actix_web::{test, App};
 use sems::{api, model::Config, model::Station};
@@ -86,19 +90,27 @@ async fn scenarios() {
     assert!(!paths.is_empty(), "no scenario found");
 
     let mut failures = Vec::new();
+    let mut table = Vec::new();
     for path in paths {
         let scenario: Scenario = serde_json::from_str(&fs::read_to_string(&path).unwrap())
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         // Announced first, so that the server log lines appear under their scenario.
         println!("── {}", scenario.name);
         match run(&scenario).await {
-            Ok(()) => println!("   ok"),
+            Ok(m) => {
+                println!("   ok");
+                println!("   {}", m.line());
+                table.push(format!("| {} | {} |", scenario.name, m.row()));
+            }
             Err(e) => {
                 println!("   FAIL: {e}");
                 failures.push(format!("{}: {e}", scenario.name));
             }
         }
     }
+    println!("\n{}", Metrics::HEADER);
+    println!("|---|---|---|---|---|---|---|");
+    println!("{}", table.join("\n"));
     assert!(
         failures.is_empty(),
         "{} scenario(s) failed:\n{}",
@@ -107,7 +119,7 @@ async fn scenarios() {
     );
 }
 
-async fn run(scenario: &Scenario) -> Result<(), String> {
+async fn run(scenario: &Scenario) -> Result<Metrics, String> {
     let config_json = match &scenario.config {
         Value::String(path) => fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
         inline => inline.to_string(),
@@ -127,6 +139,8 @@ async fn run(scenario: &Scenario) -> Result<(), String> {
     };
 
     let mut last_seq = 0;
+    let mut metrics = Metrics::default();
+    let mut previous = HashMap::new(); // Setpoints after the previous step.
     for (i, step) in scenario.steps.iter().enumerate() {
         let at = |e: String| format!("step {}: {e}", i + 1);
 
@@ -190,10 +204,148 @@ async fn run(scenario: &Scenario) -> Result<(), String> {
         )
         .await;
         check_invariant(&status).map_err(at)?;
+        let is_event = accepted.is_some();
         check_history(&mut last_seq, accepted, &latest, &status).map_err(at)?;
         check_expect(&step.expect, &status, &sessions).map_err(at)?;
+        previous = metrics.observe(&status, &previous, is_event);
     }
-    Ok(())
+    Ok(metrics)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------------------------
+
+/// Allocation quality of one scenario: worst case over its steps (churn: average per event).
+struct Metrics {
+    /// Power that could have been delivered within every limit but was not (kW, max).
+    waste_kw: f64,
+    /// `allocated / optimum` (%, min).
+    efficiency: f64,
+    /// `allocated / Σ demand` (%, min).
+    satisfaction: f64,
+    /// Jain's index over `setpoint / demand` ratios, 1 = perfectly even (min).
+    fairness: f64,
+    /// Setpoints changed, summed over accepted events.
+    churn: usize,
+    events: usize,
+    /// Worst case if every charger applied the larger of its old and new setpoint (kW, max).
+    overshoot_kw: f64,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Metrics {
+            waste_kw: 0.0,
+            efficiency: 100.0,
+            satisfaction: 100.0,
+            fairness: 1.0,
+            churn: 0,
+            events: 0,
+            overshoot_kw: 0.0,
+        }
+    }
+}
+
+impl Metrics {
+    const HEADER: &str = "| Scenario | Waste max (kW) | Efficiency min (%) | Satisfaction min (%) \
+        | Fairness min | Churn avg (setpoints/event) | Overshoot max (kW) |";
+
+    /// Folds in the state after a step; returns its setpoints (per charger/connector) for the
+    /// next step's comparison.
+    fn observe(
+        &mut self,
+        status: &Value,
+        previous: &HashMap<String, f64>,
+        is_event: bool,
+    ) -> HashMap<String, f64> {
+        let grid = num(&status["grid_kw"]);
+        let allocated = num(&status["allocated_kw"]);
+        let (mut optimum, mut demand, mut ratios) = (0.0, 0.0, Vec::new());
+        let mut setpoints = HashMap::new();
+        for charger in status["chargers"].as_array().unwrap() {
+            let mut deliverable = 0.0; // What this charger's sessions could take.
+            for connector in charger["connectors"].as_array().unwrap() {
+                let session = &connector["session"];
+                let key = format!("{}/{}", charger["id"], connector["id"]);
+                setpoints.insert(key, num(&session["setpoint_kw"]).max(0.0));
+                if session.is_null() {
+                    continue;
+                }
+                let d = num(&session["demand_kw"]);
+                deliverable += d.min(num(&connector["max_kw"]));
+                demand += d;
+                if d > 0.0 {
+                    ratios.push(num(&session["setpoint_kw"]) / d);
+                }
+            }
+            optimum += deliverable.min(num(&charger["max_kw"]));
+        }
+        let optimum = optimum.min(grid);
+
+        let pct = |part: f64, whole: f64| {
+            if whole > 0.0 {
+                100.0 * part / whole
+            } else {
+                100.0
+            }
+        };
+        let (sum, squares): (f64, f64) = (ratios.iter().sum(), ratios.iter().map(|r| r * r).sum());
+        let fairness = if squares > 0.0 {
+            sum * sum / (ratios.len() as f64 * squares)
+        } else {
+            1.0
+        };
+
+        self.waste_kw = self.waste_kw.max(optimum - allocated);
+        self.efficiency = self.efficiency.min(pct(allocated, optimum));
+        self.satisfaction = self.satisfaction.min(pct(allocated, demand));
+        self.fairness = self.fairness.min(fairness);
+        if is_event {
+            let old = |key: &String| previous.get(key).copied().unwrap_or(0.0);
+            let changed = setpoints
+                .iter()
+                .filter(|(k, &new)| (new - old(k)).abs() > EPS);
+            let peak: f64 = setpoints.iter().map(|(k, &new)| new.max(old(k))).sum();
+            self.churn += changed.count();
+            self.events += 1;
+            self.overshoot_kw = self.overshoot_kw.max(peak - grid);
+        }
+        setpoints
+    }
+
+    fn churn_avg(&self) -> f64 {
+        if self.events == 0 {
+            0.0
+        } else {
+            self.churn as f64 / self.events as f64
+        }
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "waste ≤ {:.1} kW · efficiency ≥ {:.1} % · satisfaction ≥ {:.1} % · fairness ≥ {:.2} \
+             · churn {:.1} setpoints/event · overshoot ≤ {:.1} kW",
+            self.waste_kw,
+            self.efficiency,
+            self.satisfaction,
+            self.fairness,
+            self.churn_avg(),
+            self.overshoot_kw
+        )
+    }
+
+    fn row(&self) -> String {
+        format!(
+            "{:.1} | {:.1} | {:.1} | {:.2} | {:.1} | {:.1}",
+            self.waste_kw,
+            self.efficiency,
+            self.satisfaction,
+            self.fairness,
+            self.churn_avg(),
+            self.overshoot_kw
+        )
+    }
 }
 
 /// History invariant: an accepted event adds exactly one entry, of the right kind and session,

@@ -1,70 +1,14 @@
 //! Setpoint delivery to chargers (`/chargers/{id}/setpoints`), against a real server on a
 //! random local port: WebSocket push, plain GET pull, unknown charger.
-//! Station: the brief's (`config/station.json`), grid 400 kW, CP1 and CP2 of 300 kW.
+//! Station: the brief's, grid 400 kW, CP1 and CP2 of 300 kW.
 //! Clients use `awc`, actix's own HTTP and WebSocket client.
 
-use awc::ws::Frame;
-use futures_util::{Stream, StreamExt};
-use sems::{api, model::Config, model::Station};
-use serde_json::{json, Value};
-use std::{fmt::Debug, fs, net::TcpListener, time::Duration};
-use tokio::time::timeout;
-
-/// Starts a server with the brief's station and returns its address.
-fn start() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let json = fs::read_to_string("config/station.json").unwrap();
-    let station = Station::new(Config::from_json(&json).unwrap(), api::now_ms());
-    actix_web::rt::spawn(api::serve(station, listener).unwrap());
-    addr
-}
-
-/// Opens a charger's WebSocket, as a real charger would.
-async fn subscribe(
-    addr: &str,
-    charger: &str,
-) -> impl Stream<Item = Result<Frame, impl Debug>> + Unpin {
-    let url = format!("ws://{addr}/chargers/{charger}/setpoints");
-    awc::Client::new().ws(url).connect().await.unwrap().1
-}
-
-/// Next pushed message, or `None` if nothing arrives within 200 ms.
-async fn next(ws: &mut (impl Stream<Item = Result<Frame, impl Debug>> + Unpin)) -> Option<Value> {
-    match timeout(Duration::from_millis(200), ws.next()).await.ok()? {
-        Some(Ok(Frame::Text(text))) => Some(serde_json::from_slice(&text).unwrap()),
-        other => panic!("unexpected frame: {other:?}"),
-    }
-}
-
-/// Setpoint (kW) of connector `n` in a setpoints message.
-fn kw(msg: &Value, n: u32) -> f64 {
-    let connector = msg["setpoints"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["connector"] == n);
-    connector.unwrap()["kw"].as_f64().unwrap()
-}
-
-async fn connect(addr: &str, charger: &str, connector: u32, demand_kw: f64) {
-    let body = json!({ "charger": charger, "connector": connector, "demand_kw": demand_kw });
-    let res = awc::Client::new()
-        .post(format!("http://{addr}/sessions"))
-        .send_json(&body)
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 201);
-}
-
-async fn get(url: String) -> (u16, Value) {
-    let mut res = awc::Client::new().get(url).send().await.unwrap();
-    (res.status().as_u16(), res.json().await.unwrap())
-}
+mod common;
+use common::{brief, connect, get, kw, next, start, subscribe};
 
 #[actix_web::test]
 async fn other_charger_is_told_without_asking() {
-    let addr = start();
+    let addr = start(&brief());
     let mut cp1 = subscribe(&addr, "CP1").await;
     let mut cp2 = subscribe(&addr, "CP2").await;
 
@@ -88,7 +32,7 @@ async fn other_charger_is_told_without_asking() {
 
 #[actix_web::test]
 async fn no_message_when_setpoints_do_not_change() {
-    let addr = start();
+    let addr = start(&brief());
     let mut cp1 = subscribe(&addr, "CP1").await;
     next(&mut cp1).await.unwrap();
 
@@ -101,7 +45,7 @@ async fn no_message_when_setpoints_do_not_change() {
 
 #[actix_web::test]
 async fn unknown_charger_is_404() {
-    let addr = start();
+    let addr = start(&brief());
     let (code, body) = get(format!("http://{addr}/chargers/CP9/setpoints")).await;
     assert_eq!(code, 404);
     assert!(body["error"].is_string());

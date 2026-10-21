@@ -589,3 +589,114 @@ step 1 with `history: expected seq 1, got 2`.
 - **Query validation**: an invalid `session` (not a UUID) or `limit` returns a JSON 422, like
   other errors (`QueryConfig` error handler). An unknown session returns an empty list.
 - **`allocated_kw` is not stored**: it is derived from the recorded setpoints when rendering.
+
+---
+
+## Step 6 — V1, increment 6: allocation metrics and end-to-end performance (2026-10-21)
+
+**Scope**: `tests/scenarios.rs` (metrics), `tests/perf.rs` (P1, P2; P3 kept), `tests/common/mod.rs`
+(server/client helpers shared by `push.rs` and `perf.rs`), README (performance and metrics).
+**V1 is complete.**
+
+**Result**: 20 unit tests + 15 scenarios + 3 push tests pass, `clippy` clean. Several metric
+values were checked by hand (waste of S07, S09, S15; fairness of S09; overshoot of S04).
+
+### V1 allocation metrics (baseline for V2)
+
+Worst case over each scenario's steps (churn: average per accepted event).
+
+| Scenario | Waste max (kW) | Efficiency min (%) | Satisfaction min (%) | Fairness min | Churn avg (setpoints/event) | Overshoot max (kW) |
+|---|---|---|---|---|---|---|
+| S01 empty station | 0.0 | 100.0 | 100.0 | 1.00 | 0.0 | 0.0 |
+| S02 single vehicle | 0.0 | 100.0 | 85.7 | 1.00 | 1.0 | 0.0 |
+| S03 two vehicles on the same charger | 0.0 | 100.0 | 50.0 | 1.00 | 1.5 | 50.0 |
+| S04 two vehicles on different chargers | 0.0 | 100.0 | 66.7 | 1.00 | 1.5 | 100.0 |
+| S05 a vehicle leaves | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
+| S06 full station | 0.0 | 100.0 | 33.3 | 1.00 | 2.5 | 100.0 |
+| S07 demand decreases then increases | 100.0 | 71.4 | 66.7 | 0.96 | 1.2 | 100.0 |
+| S08 demand above the connector limit | 0.0 | 100.0 | 50.0 | 1.00 | 1.0 | 0.0 |
+| S09 heterogeneous chargers | 166.7 | 55.2 | 55.2 | 0.91 | 1.7 | 0.0 |
+| S10 V1 known waste | 33.3 | 93.3 | 50.0 | 1.00 | 1.3 | 0.0 |
+| S11 invalid events | 0.0 | 100.0 | 100.0 | 1.00 | 1.0 | 0.0 |
+| S12 demand increase under contention | 100.0 | 71.4 | 66.7 | 0.96 | 1.0 | 0.0 |
+| S13 cascading release | 113.3 | 68.8 | 33.3 | 0.85 | 2.4 | 100.0 |
+| S14 zero demand takes no share | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
+| S15 plugged in but not charging | 30.0 | 90.0 | 50.0 | 0.90 | 1.8 | 50.0 |
+
+**Reading**
+
+- **Safe, but wasteful**: waste reaches 166.7 kW (S09: the share left unused by a 22 kW AC
+  charger is not handed to the 300 kW charger), 113.3 kW in S13, 100 kW in S07/S12. V2 targets
+  0 kW everywhere; the cost to watch is churn (redistributing disturbs more chargers).
+- **Transition risk quantified**: whenever a share moves from one charger to another, a charger
+  ramping up before the other has reduced would overload the grid by up to 100 kW. This is the
+  case for "decrease before increase" (V3), which should bring overshoot to 0.
+- Satisfaction below 100 % is expected when the station is saturated (S06: 4 × 300 kW requested
+  on a 400 kW grid); it is not a defect.
+
+### Performance (release, native, 2017 MacBook Pro, ranges over 3 runs)
+
+| Test | p50 | p99 | max |
+|---|---|---|---|
+| P1 event → push to another charger (200 runs) | 155–171 µs | 282–464 µs | 444–582 µs |
+| P2 request latency, 8 clients × 500 events, 20 sessions | 1.0–1.2 ms | 3.0–3.4 ms | 3.6–6.2 ms |
+| P3 allocation, 4 / 100 / 10,000 sessions (p50) | 0.4–0.6 µs | 2.8 µs | 248–255 µs |
+
+P2 throughput: **5,300–5,900 events/s**, safety invariant checked on all 4,000 responses, all
+events found in `/events`. P1's worst case (< 0.6 ms) is ~1,700 times below the 1 s requirement.
+
+### Decisions
+
+- **Metrics computed by the test runner from `/status`**, not by the server: measurement stays
+  out of the product. Worst case per scenario (like p99/max for latency: for critical
+  infrastructure the worst moment matters), except churn (a recurring cost: average).
+- **Optimum** = `min(grid, Σ chargers min(charger, Σ sessions min(demand, connector)))`: the
+  most power deliverable under the nested limits; V2's water-filling should reach it.
+- **Overshoot is measured at grid level only.** Chargers have the same transition risk (S03:
+  A going 300 → 150 while B goes 0 → 150 could briefly put 450 kW on a 300 kW charger); not
+  measured yet, noted for V3.
+- **P1 toggles B between 0 and 300 kW**: with V1's equal share, only a change in the number of
+  active sessions moves A's setpoint (300 ↔ 200 kW).
+- **Perf tests run with `--test-threads=1`** so that P1, P2 and P3 do not compete for CPU.
+- **Shared helpers in `tests/common/mod.rs`** (start a server, subscribe, connect…), used by
+  `push.rs` and `perf.rs`, instead of duplicating them.
+- **Honesty about the figures**: client and server share the machine (upper bounds), every event
+  response carries the full station state (part of P2's cost), max values vary with OS
+  scheduling (hence ranges).
+
+---
+
+## Step 7 — Critical review of the tests, and a bug fix (2026-10-21)
+
+**Bug found while reviewing the tests** (none of them caught it): two sessions requesting
+`1e20` kW killed the server.
+
+1. `kw_to_w(1e20)` saturated silently to `u64::MAX` (Rust's float → integer cast).
+2. Summing two such demands for `unserved_kw` overflowed: a panic in debug, **under the lock**.
+3. The lock was poisoned and, by design ("fail loudly"), every later request panicked too.
+   In release (the Docker image) the sum wrapped silently instead: no crash, but wrong values.
+
+**Fix**: `kw_to_w` rejects any power above `MAX_KW` = 1,000,000 kW (1 GW) instead of saturating;
+the API answers 422. One bound for every power from the outside world (demands and config):
+no site or vehicle comes close, and it keeps every sum far from `u64` overflow (18 million
+sessions at 1 GW would be needed). Checked against the real server: both requests now get a
+422, the 1 GW limit is accepted, `/status` keeps answering, no panic in the log.
+Rejected: a 10 MW cap on demands plus saturating additions (two mechanisms where one bound at
+the edge suffices). Regression: unit test on `kw_to_w` and scenario S16.
+
+**Review of the test suite — remaining weaknesses** (documented, not all addressed):
+
+| # | Weakness | Decision |
+|---|---|---|
+| 1 | Only hand-written scenarios: we test what we imagined (this is how the bug slipped through) | Randomized property test (seeded generator, shadow model predicting HTTP codes, invariants at every step): **postponed to V2**, where it also checks "waste = 0" |
+| 2 | Expected values computed by the author of the algorithm (shared misunderstanding possible) | Mitigated by algorithm-independent invariants; V2's optimum acts as an oracle |
+| 3 | A panic under the lock takes the whole service down | To be discussed |
+| 4 | Time-based assertions ("no message within 200 ms", "< 1 s") can pass or fail by timing | Accepted for now (3/3 green runs) |
+| 5 | Order of pushed messages under concurrency not tested | Later, with the WebSocket work |
+| 6 | WebSocket edge cases (close, many clients, reconnection) not tested | Later, with the WebSocket work |
+| 7 | Overshoot measured at grid level only; runtime Docker image only smoke-tested by hand | Noted |
+| 8 | Mutation testing done by hand, case by case | Accepted |
+
+Strengths kept: two invariants checked at every step independently of expected values, a
+mandatory `why` per scenario, real server and clients for push and performance, tests verified
+against deliberate bugs.

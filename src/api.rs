@@ -14,7 +14,7 @@
 //! then written after it is released. Publishing to the `watch` channels is in-memory and done
 //! under the lock, so concurrent events are published in the order they were applied.
 
-use crate::model::{kw_to_w, EventError, EventKind, Record, Station, Status, Watts};
+use crate::model::{kw_to_w, EventError, EventKind, Record, Station, Status, Watts, MAX_KW};
 use actix_web::{
     dev::Server, error::InternalError, http::header, http::StatusCode, web, App, HttpRequest,
     HttpResponse, HttpServer,
@@ -283,10 +283,8 @@ fn error(code: StatusCode, message: impl ToString) -> HttpResponse {
 }
 
 fn invalid_demand() -> HttpResponse {
-    error(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "demand_kw must be a finite number >= 0",
-    )
+    let message = format!("demand_kw must be a number between 0 and {MAX_KW}");
+    error(StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
 fn event_error(e: EventError) -> HttpResponse {

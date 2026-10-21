@@ -1,0 +1,12 @@
+{
+  "name": "S16 absurd demand values",
+  "why": "Regression: two demands of 1e20 kW used to overflow an integer sum under the lock and take the whole server down. Powers above 1 GW are now rejected (422) instead of silently saturated; the station keeps working.",
+  "config": "config/station.json",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 1e20 }, "expect": { "http": 422 } },
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 1000000 }, "expect": { "setpoints": { "A": 300 } } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 1000000 },
+      "expect": { "setpoints": { "A": 200, "B": 200 }, "unserved_kw": 1999600 } },
+    { "change": { "session": "B", "demand_kw": 1000000.001 }, "expect": { "http": 422, "setpoints": { "B": 200 } } }
+  ]
+}

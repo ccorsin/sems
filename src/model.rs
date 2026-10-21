@@ -14,9 +14,14 @@ use uuid::Uuid;
 /// Power in watts.
 pub type Watts = u64;
 
-/// Converts a kW value from the outside world to watts. `None` if negative or not finite.
+/// Largest power accepted from the outside world (1 GW). No site or vehicle comes close, and it
+/// keeps every sum of powers far from `u64` overflow (that would take 18 million sessions).
+pub const MAX_KW: f64 = 1_000_000.0;
+
+/// Converts a kW value from the outside world to watts.
+/// `None` if negative, not finite or above [`MAX_KW`] (never silently saturated).
 pub fn kw_to_w(kw: f64) -> Option<Watts> {
-    (kw.is_finite() && kw >= 0.0).then(|| (kw * 1000.0).round() as Watts)
+    (kw.is_finite() && (0.0..=MAX_KW).contains(&kw)).then(|| (kw * 1000.0).round() as Watts)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -431,6 +436,9 @@ mod tests {
         assert_eq!(kw_to_w(0.0), Some(0));
         assert_eq!(kw_to_w(-1.0), None);
         assert_eq!(kw_to_w(f64::NAN), None);
+        assert_eq!(kw_to_w(MAX_KW), Some(1_000_000_000));
+        // Regression: 1e20 kW used to saturate to u64::MAX, then overflow when summed.
+        assert_eq!(kw_to_w(1e20), None);
     }
 
     #[test]

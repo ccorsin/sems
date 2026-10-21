@@ -48,12 +48,22 @@ The server logs one line per accepted event on stdout (`docker compose logs -f s
 
 ## Run the tests
 
+With Docker only:
+
 ```bash
-docker compose run --rm test                     # with Docker
-cargo test                                       # natively (stable Rust)
-cargo test --test scenarios -- --nocapture       # one block per scenario
-cargo test --release --test perf -- --ignored --nocapture   # performance
+# All tests: unit, scenarios, push
+docker compose run --rm test
+# Scenarios one by one, with their metrics and the summary table
+docker compose run --rm test cargo test --test scenarios -- --nocapture
+# Performance (release build inside the container: first run takes a few minutes)
+docker compose run --rm test cargo test --release --test perf -- --ignored --nocapture --test-threads=1
 ```
+
+Natively (stable Rust): the same commands without `docker compose run --rm test`, e.g.
+`cargo test` or `cargo test --test scenarios -- --nocapture`.
+
+Performance figures measured inside Docker on macOS include the Docker VM's overhead (on the
+dev machine: P1 max ≈ 2 ms, P2 ≈ 2,500 events/s); the figures below were measured natively.
 
 - **Unit tests** (`src/*.rs`): configuration validation, session lifecycle and statuses,
   allocation algorithm, malformed requests.
@@ -86,6 +96,7 @@ cargo test --release --test perf -- --ignored --nocapture   # performance
 | S13 | Cascading release | Released power across several vehicles and chargers |
 | S14 | Zero demand | A full vehicle still plugged in takes no share |
 | S15 | Plugged in, not charging | Status `charging` → `suspended_ev` → `charging` for OPS |
+| S16 | Absurd demand values | Regression: powers above 1 GW are rejected (422) instead of overflowing |
 
 Each file carries its own `why`. To add a scenario, drop a JSON file in `scenarios/`: it is
 picked up automatically. Format:
@@ -115,7 +126,7 @@ All powers are in kW. Errors are `{"error": "<message>"}`.
 
 | Method | Route | Body | Success | Errors |
 |---|---|---|---|---|
-| `POST` | `/sessions` | `{"charger", "connector", "demand_kw"}` | `201` | 404 unknown charger/connector, 409 connector busy, 422 invalid body or demand |
+| `POST` | `/sessions` | `{"charger", "connector", "demand_kw"}` | `201` | 404 unknown charger/connector, 409 connector busy, 422 invalid body or demand (powers are 0 to 1,000,000 kW) |
 | `PUT` | `/sessions/{id}` | `{"demand_kw"}` | `200` | 404 unknown session, 422 |
 | `DELETE` | `/sessions/{id}` | — | `200` | 404 unknown session |
 | `GET` | `/status` | — | `200` | — |
@@ -209,21 +220,70 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
 
 ## Performance
 
-Allocation time vs number of sessions (release build, 2017 MacBook Pro, 1,000 runs each):
+`cargo test --release --test perf -- --ignored --nocapture --test-threads=1`. Release build,
+natively on a 2017 MacBook Pro (i7-7700HQ); ranges over 3 runs. Client and server share the
+machine, so these are upper bounds; max values vary with OS scheduling.
 
-| Sessions | p50 | p99 | max |
-|---|---|---|---|
-| 4 | 0.36 µs | 0.38 µs | 1.4 µs |
-| 100 | 2.7 µs | 5.1 µs | 36.4 µs |
-| 10,000 | 236 µs | 365 µs | 432 µs |
+| Test | What | p50 | p99 | max |
+|---|---|---|---|---|
+| **P1** | Event on one charger → new setpoint received over WebSocket by **another** charger (200 runs) | 155–171 µs | 282–464 µs | 444–582 µs |
+| **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.0–1.2 ms | 3.0–3.4 ms | 3.6–6.2 ms |
+| **P3** | Allocation alone, 4 sessions | 0.4–0.6 µs | 1.7–3.5 µs | ≤ 0.4 ms |
+| | Allocation alone, 100 sessions | 2.8 µs | 6–19 µs | ≤ 0.7 ms |
+| | Allocation alone, 10,000 sessions | 248–255 µs | 0.56–0.63 ms | ≤ 1.4 ms |
 
-Linear growth, far below the 1 s budget: end-to-end latency is dominated by the network.
+- **P1, the brief's requirement** (< 1 s): the worst case measured is under 0.6 ms, about
+  1,700 times below the budget.
+- **P2**: **5,300–5,900 events/s** with the safety invariant checked on every one of the
+  4,000 responses, and every event found in `/events`. A real station sees a few events per
+  second: this is headroom, not a target. Each response carries the full station state,
+  which is part of this cost.
+- **P3**: linear growth; computation is never the bottleneck.
+
+## Allocation metrics (V1 baseline)
+
+Computed by the scenario runner (`cargo test --test scenarios -- --nocapture`), worst case
+over each scenario's steps. Optimum = the most power deliverable within every limit:
+`min(grid, Σ chargers min(charger, Σ sessions min(demand, connector)))`.
+
+| Metric | Meaning |
+|---|---|
+| Waste (kW) | `optimum − allocated`: power deliverable within every limit, but not given |
+| Efficiency (%) | `allocated / optimum` |
+| Satisfaction (%) | `allocated / Σ demand` (below 100 % is normal when the station is saturated) |
+| Fairness | Jain's index over `setpoint / demand` ratios; 1 = perfectly even |
+| Churn (setpoints/event) | Setpoints changed per accepted event: how many chargers are disturbed |
+| Overshoot (kW) | Grid overload if every charger applied the larger of its old and new setpoint during a transition |
+
+| Scenario | Waste max (kW) | Efficiency min (%) | Satisfaction min (%) | Fairness min | Churn avg (setpoints/event) | Overshoot max (kW) |
+|---|---|---|---|---|---|---|
+| S01 empty station | 0.0 | 100.0 | 100.0 | 1.00 | 0.0 | 0.0 |
+| S02 single vehicle | 0.0 | 100.0 | 85.7 | 1.00 | 1.0 | 0.0 |
+| S03 two vehicles on the same charger | 0.0 | 100.0 | 50.0 | 1.00 | 1.5 | 50.0 |
+| S04 two vehicles on different chargers | 0.0 | 100.0 | 66.7 | 1.00 | 1.5 | 100.0 |
+| S05 a vehicle leaves | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
+| S06 full station | 0.0 | 100.0 | 33.3 | 1.00 | 2.5 | 100.0 |
+| S07 demand decreases then increases | 100.0 | 71.4 | 66.7 | 0.96 | 1.2 | 100.0 |
+| S08 demand above the connector limit | 0.0 | 100.0 | 50.0 | 1.00 | 1.0 | 0.0 |
+| S09 heterogeneous chargers | 166.7 | 55.2 | 55.2 | 0.91 | 1.7 | 0.0 |
+| S10 V1 known waste | 33.3 | 93.3 | 50.0 | 1.00 | 1.3 | 0.0 |
+| S11 invalid events | 0.0 | 100.0 | 100.0 | 1.00 | 1.0 | 0.0 |
+| S12 demand increase under contention | 100.0 | 71.4 | 66.7 | 0.96 | 1.0 | 0.0 |
+| S13 cascading release | 113.3 | 68.8 | 33.3 | 0.85 | 2.4 | 100.0 |
+| S14 zero demand takes no share | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
+| S15 plugged in but not charging | 30.0 | 90.0 | 50.0 | 0.90 | 1.8 | 50.0 |
+| S16 absurd demand values | 0.0 | 100.0 | 0.0 | 1.00 | 1.5 | 100.0 |
+
+**Reading**: V1 is safe (the invariant holds at every step) but **wastes up to 166.7 kW**
+(S09: a small charger's unused share is not handed to the big one): V2 (water-filling) targets
+0 kW of waste everywhere. **Potential overshoot reaches 100 kW** whenever a share moves from
+one charger to another: this is the transition risk addressed by "decrease before increase" (V3).
 
 ## Roadmap
 
 | Version | Content |
 |---|---|
-| **V1** (in progress) | REST API ✅, scenarios ✅, Docker ✅, WebSocket push of setpoints ✅, `/events` history ✅; next: metrics and end-to-end performance tests |
-| V2 | Water-filling allocation: no waste, released power goes to the other sessions |
+| **V1** ✅ | REST API, scenarios, Docker, WebSocket push of setpoints, `/events` history, allocation metrics, end-to-end performance tests |
+| V2 | Water-filling allocation: no waste, released power goes to the other sessions; randomized property test (random stations and events, invariants at every step) |
 | V3 | "Decrease before increase" transitions, minimum viable power per session, offline chargers |
 | V4 | Battery storage (BESS): boost, 10% SoC floor, opportunistic charging |
