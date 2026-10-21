@@ -8,11 +8,12 @@ leaves).
 Written in Rust (actix-web). The design process, every decision and the alternatives considered
 are traced step by step in [`JOURNAL.md`](JOURNAL.md).
 
-> Current version: **V3.2** — max-min fair water-filling (no power left unused while a vehicle
+> Current version: **V4** — max-min fair water-filling (no power left unused while a vehicle
 > could take it), **safe transitions** (a decrease is applied before any increase, so the grid
-> is never exceeded, even while chargers apply their new setpoints) and a live **OPS view**
-> (connector and charger availability, power availability). Earlier versions are on branches
-> `v1` and `v2`. See the [roadmap](#roadmap).
+> is never exceeded, even while chargers apply their new setpoints), a live **OPS view**
+> (connector and charger availability, power availability) and an optional **battery (BESS)**
+> (boost, 10 % state-of-charge floor, opportunistic charging). Earlier versions are on branches
+> `v1`, `v2` and `v3`. See the [roadmap](#roadmap).
 
 ## Quick start
 
@@ -94,7 +95,8 @@ dev machine: P1 max ≈ 2 ms, P2 ≈ 2,500 events/s); the figures below were mea
   `"acks": "manual"` acknowledge explicitly.
 - **Randomized** (`tests/random.rs`): random stations (1–5 chargers of 7–350 kW, 10–1500 kW grid)
   and 100 random steps each, including invalid targets, absurd demands and acknowledgements that
-  are late, stale, for a future version, for an unknown charger, or never sent. A shadow model
+  are late, stale, for a future version, for an unknown charger, or never sent; one station in
+  two has a BESS whose state of charge is reported at random. A shadow model
   predicts every HTTP code; the same properties are checked after every step, plus **no waste
   beyond rounding** (< 1 W per session) once settled. Seeded and reproducible: a failure prints
   its seed. It tests what no hand-written scenario imagined.
@@ -130,6 +132,9 @@ dev machine: P1 max ≈ 2 ms, P2 ≈ 2,500 events/s); the figures below were mea
 | S20 | Silent charger | Known limitation: a charger that never acknowledges freezes every increase (safety first) |
 | S21 | Pending decrease holds an unrelated increase | The barrier is station-wide: an increase elsewhere waits even when it would already fit |
 | S22 | OPS view during a pending acknowledgement | The exposed state (statuses, targets, pending chargers, totals) reflects a partial transition |
+| S23 | BESS boost | Above the 10 % floor, two vehicles get 300 kW each on a 400 kW grid; the BESS discharges exactly the excess, the grid import stays at 400 kW |
+| S24 | BESS state-of-charge floor | Below 10 % the boost disappears: vehicles drop back to the grid's share, the BESS idles; above 10 % again, the boost returns |
+| S25 | BESS opportunistic charge | The BESS charges only with what the vehicles leave, idles when full or while its SoC is unknown |
 
 Each file carries its own `why`. To add a scenario, drop a JSON file in `scenarios/`: it is
 picked up automatically. Format:
@@ -153,6 +158,8 @@ picked up automatically. Format:
 (`setpoints`, `targets`, `statuses`, `pending`, `allocated_kw`, `available_kw`, `unserved_kw`,
 `http`); without `http`, a 2xx is required. With `"acks": "manual"`, a step can be
 `{ "ack": "CP1" }` (its latest version) or `{ "ack": { "charger": "CP1", "version": 2 } }`.
+A step `{ "soc": 0.42 }` reports the BESS state of charge; BESS expectations are `capacity_kw`,
+`grid_import_kw`, `bess_mode` and `bess_kw`.
 
 ## Communication: who speaks first
 
@@ -210,6 +217,43 @@ failed and excluded from the allocation; note that excluding it assumes it fell 
 safe setpoint on its own (as OCPP's fallback profiles do), which the server cannot verify.
 Also: OPS ending its sessions with `DELETE` does not release a silent charger's hold.
 
+## Battery storage (BESS)
+
+Optional, declared in the station config:
+
+```json
+"bess": { "capacity_kwh": 200, "max_kw": 200 }
+```
+
+Without it, nothing changes. With it, three rules, recomputed on every event:
+
+| Rule | Definition |
+|---|---|
+| **Boost** and **anti over-discharge** | Power offered to vehicles = `grid + max_kw` while the state of charge (SoC) is above **10 %**, `grid` otherwise (or while the SoC is unknown). The water-filling runs unchanged on that capacity. |
+| **One flow at a time** | With V the vehicles' granted total: **discharging** `V − grid` if V > grid; else **charging** `min(grid − V, max_kw)` while not full (vehicles first: the BESS only takes what they leave); else **idle** (no flow: power 0). |
+| **Grid connection** | The import is `V − discharge + charge`: always between 0 and the grid limit, never an overload, never an export. |
+
+The BMS reports the SoC: `POST /bess {"soc": 0.42}` (0 to 1). The BESS speaks first, so it is an
+HTTP request, like a charger event; it may change the capacity, hence the allocation, and is
+recorded in `/events` (kind `bess_soc`). `GET /status` adds `capacity_kw`, `grid_import_kw` and a
+`bess` block: `soc`, `mode` (`charging`, `discharging`, `idle`), `power_kw`, `boost_kw`,
+`energy_above_floor_kwh`.
+
+**Why no acknowledgement for the BESS.** Commanding its power from the server would make every
+boost transition unsafe one way or the other: vehicles ramping up first overload the grid, the
+BESS discharging first exports. Instead, the BESS works as station BESS do (peak shaving): its
+inverter regulates the flow at the grid connection locally, discharging only what the site draws
+beyond the grid and charging only with the headroom. The server only *plans*: it decides the
+capacity offered to vehicles and the mode, and vehicle setpoints keep going through the
+acknowledgement barrier. When the SoC falls below 10 %, vehicle decreases are published at once
+and the BESS keeps covering them until they are applied: that is why the floor is the
+software's own rule, above the BMS hardware cut-off. The barrier stays for the chargers, where a
+third-party vehicle and a network link bring uncertainty; the BESS is the station's own asset.
+
+**Assumptions.** The SoC is an input received from the BMS, never computed here (no energy
+integration over time). The BESS applies its mode reliably and almost instantly, regulating the
+grid connection locally (no export). Its hardware cut-off is below the 10 % floor.
+
 ## API
 
 All powers are in kW. Errors are `{"error": "<message>"}`.
@@ -220,6 +264,7 @@ All powers are in kW. Errors are `{"error": "<message>"}`.
 | `PUT` | `/sessions/{id}` | `{"demand_kw"}` | `200` | 404 unknown session, 422 |
 | `DELETE` | `/sessions/{id}` | — | `200` | 404 unknown session |
 | `POST` | `/chargers/{id}/ack` | `{"version"}` | `200` | 404 unknown charger, 422 version never sent |
+| `POST` | `/bess` | `{"soc"}` (0 to 1) | `200` | 404 station without BESS, 422 invalid SoC |
 | `GET` | `/status` | — | `200` | — |
 | `GET` | `/events?limit=100&session=<id>` | — | `200` | 422 invalid `limit` or `session` |
 | `GET` | `/chargers/{id}/setpoints` | — | `200`, or WebSocket upgrade | 404 unknown charger |
@@ -263,6 +308,9 @@ acknowledgements go over HTTP. Closing the WebSocket releases nothing (see limit
 | `pending_acks` | Station level: chargers whose acknowledgement is awaited, with the version to acknowledge |
 | `version` | Charger level: version of its latest setpoints |
 | `online`, `online_since_ms` | Charger level: a setpoint WebSocket is open, and since when it is online or offline |
+| `capacity_kw` | Station level: power offered to vehicles, the grid plus the BESS boost |
+| `grid_import_kw` | Station level: drawn from the grid, always between 0 and `grid_kw` |
+| `bess` | Station level: `soc`, `mode`, `power_kw`, `boost_kw`, `energy_above_floor_kwh` (`null` without BESS) |
 | `available_kw` (charger) | Charger headroom: `max_kw − allocated_kw` (not necessarily usable: the grid may be saturated) |
 
 ### OPS view
@@ -274,7 +322,7 @@ availability, power availability…)"*. All of it is in `GET /status`, read at a
 |---|---|
 | **Connector availability** | `chargers[].connectors[].status`: `available`, `charging`, `suspended_ev` (plugged in, the vehicle requests nothing), `suspended_evse` (plugged in, the station gives nothing yet), with `status_since_ms` |
 | **Charger availability** | `chargers[].online` (its setpoint WebSocket is open) and `online_since_ms` |
-| **Power availability** | Station: `grid_kw`, `allocated_kw`, `available_kw`, `unserved_kw`. Charger: `max_kw`, `allocated_kw`, `available_kw`, `unserved_kw`. Session: `demand_kw`, `setpoint_kw`, `target_kw` |
+| **Power availability** | Station: `grid_kw`, `capacity_kw`, `allocated_kw`, `available_kw`, `unserved_kw`, `grid_import_kw`; BESS: `bess.mode`, `bess.power_kw`, `bess.boost_kw`, `bess.energy_above_floor_kwh`. Charger: `max_kw`, `allocated_kw`, `available_kw`, `unserved_kw`. Session: `demand_kw`, `setpoint_kw`, `target_kw` |
 | What is blocking | `pending_acks`: chargers whose acknowledgement holds increases |
 | What happened | `GET /events`: every accepted event with the allocation that resulted from it |
 
@@ -347,6 +395,9 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
   versions taken from the history's `seq`. Simplest rule that keeps the grid safe during
   transitions; see [Safe transitions](#safe-transitions-decrease-before-increase).
 - **HTTP in, WebSocket out**: see [Communication](#communication-who-speaks-first).
+- **BESS as a planning input** (V4): the server sizes the capacity and decides the mode; the
+  BESS regulates the grid connection locally; no acknowledgement for the station's own asset.
+  See [Battery storage](#battery-storage-bess).
 
 ## Assumptions and limitations
 
@@ -355,6 +406,9 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
 - One server per station. No authentication. State is lost on restart.
 - A setpoint received is assumed applied at once (no ramp time modelled); an acknowledgement
   confirms reception, not a measured power.
+- **BESS**: the SoC is an input from the BMS (not computed); the BESS regulates the grid
+  connection locally and applies its mode almost instantly; no hysteresis around the 10 % floor,
+  so a SoC oscillating around it switches the boost on and off.
 - **No minimum viable power per session (not covered).** With many vehicles on a small grid,
   shares can become too small to be useful. The sketched rule: a configurable minimum; sessions
   admitted in arrival order while each can get it; the others wait at 0 kW as `suspended_evse`,
@@ -434,7 +488,7 @@ over each scenario's steps. Optimum = the most power deliverable within every li
 | S13 cascading release | 113.3 → **0.0** |
 | S17 heterogeneous chargers under contention | 39.0 → **0.0** |
 
-**V3, all scenarios** (S01–S17 measured on the settled station; S18–S22 acknowledge manually,
+**V3 and V4, all scenarios** (S01–S17 and S23–S25 measured on the settled station; S18–S22 acknowledge manually,
 so their figures include the time spent waiting for acknowledgements):
 
 | Scenario | Waste max (kW) | Efficiency min (%) | Satisfaction min (%) | Fairness min | Churn avg (setpoints/event) | Overshoot max (kW) |
@@ -461,6 +515,9 @@ so their figures include the time spent waiting for acknowledgements):
 | S20 silent charger freezes increases | 200.0 | 50.0 | 33.3 | 0.50 | 0.5 | 0.0 |
 | S21 pending decrease holds an unrelated increase | 150.0 | 50.0 | 50.0 | 0.74 | 0.8 | 0.0 |
 | S22 OPS view during a pending acknowledgement | 200.0 | 50.0 | 33.3 | 0.50 | 1.0 | 0.0 |
+| S23 BESS boost | 0.0 | 100.0 | 100.0 | 1.00 | 0.7 | 0.0 |
+| S24 BESS state-of-charge floor | 0.0 | 100.0 | 66.7 | 1.00 | 1.2 | 0.0 |
+| S25 BESS opportunistic charge | 0.0 | 100.0 | 100.0 | 1.00 | 0.5 | 0.0 |
 
 **Reading**
 
@@ -490,5 +547,5 @@ so their figures include the time spent waiting for acknowledgements):
 | **V2** ✅ | Max-min fair water-filling: no waste, released power goes to the other sessions; randomized property test (random stations and events, properties at every step) |
 | **V3.1** ✅ | Safe transitions: decrease before increase, versioned acknowledgements over HTTP, transition invariant checked everywhere |
 | **V3.2** ✅ | OPS view: charger availability (`online`, `online_since_ms`) and available power per charger |
-| Later | Timeout for a charger that never acknowledges; minimum viable power per session (UX more than safety); finer acknowledgement barrier |
-| V4 | Battery storage (BESS): boost, 10% SoC floor, opportunistic charging |
+| **V4** ✅ | Battery storage (BESS): boost, 10 % SoC floor, opportunistic charging, one flow at a time, never an export |
+| Later | Timeout for a charger that never acknowledges; hysteresis around the SoC floor; minimum viable power per session (UX more than safety); finer acknowledgement barrier |

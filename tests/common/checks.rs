@@ -1,6 +1,7 @@
 //! Properties checked on the API output after every step, by the scenario runner and the
 //! randomized test. They hold whatever the allocation policy: no expected value is hard-coded.
 
+use sems::model::MIN_SOC;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -168,12 +169,15 @@ fn check_bess(status: &Value, allocated: f64) -> Result<(), String> {
         true => ("idle", 0.0),
         false => (bess["mode"].as_str().unwrap(), num(&bess["power_kw"])),
     };
-    let expected = if allocated > grid + EPS {
+    // The mode is decided on exact values (watts, as the server does): a 1 W remainder of the
+    // floor rounding is real headroom. EPS only tolerates float noise when comparing powers.
+    let tiny = 1e-6;
+    let expected = if allocated > grid + tiny {
         ("discharging", allocated - grid)
     } else {
         let headroom = (grid - allocated).min(num(&bess["max_kw"]));
         let soc = bess["soc"].as_f64();
-        match soc.is_some_and(|soc| soc < 1.0) && headroom > EPS {
+        match soc.is_some_and(|soc| soc < 1.0) && headroom > tiny {
             true => ("charging", headroom),
             false => ("idle", 0.0),
         }
@@ -183,6 +187,18 @@ fn check_bess(status: &Value, allocated: f64) -> Result<(), String> {
     } else {
         expected
     };
+    // Boost and floor: the BESS adds its maximum above MIN_SOC, nothing otherwise.
+    let soc = bess["soc"].as_f64();
+    let boost = match !bess.is_null() && soc.is_some_and(|soc| soc > MIN_SOC) {
+        true => num(&bess["max_kw"]),
+        false => 0.0,
+    };
+    if (capacity(status) - (grid + boost)).abs() > EPS {
+        return Err(format!(
+            "bess: capacity {} kW, expected grid {grid} + boost {boost}",
+            capacity(status)
+        ));
+    }
     if mode != expected.0 || (power - expected.1).abs() > EPS {
         return Err(format!(
             "bess: {mode} {power} kW, expected {} {} kW",

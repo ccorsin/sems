@@ -28,12 +28,14 @@ the allocation that resulted from it.
 | V2 | Max-min fair water-filling, first inside each charger, then across the grid | 0 kW unused in every scenario; end-to-end latency unchanged |
 | V3.1 | Decrease before increase: decreases are published at once; increases wait until every charger with a pending decrease acknowledges its latest version (`POST /chargers/{id}/ack`, version = event `seq`) | 0 kW of transition overshoot on every transition; a charger that never acknowledges freezes increases (documented limitation) |
 | V3.2 | OPS view completed: each charger's `online` status (a setpoint WebSocket is open) with `online_since_ms`, and available power per charger | Every item the brief lists for OPS is in `/status`; going offline releases nothing |
+| V4 | Optional BESS: capacity = grid + its power above a 10 % SoC (reported by the BMS); one flow at a time (discharge the excess, else charge the headroom, else idle); the BESS regulates the grid connection locally | Vehicles get up to the BESS power on top of the grid; the grid import stays within 0..=grid, never an export |
 
-**Tests.** Unit tests on configuration, model and allocator; 22 declarative JSON scenarios, each
+**Tests.** Unit tests on configuration, model and allocator; 25 declarative JSON scenarios, each
 with its `why`, replayed through the API with four properties checked after every request
 (safety, transition, history, consistency) and allocation metrics per scenario; a seeded
 randomized test (random stations and events, including invalid requests and late, stale, future
-or missing acknowledgements, with a shadow model predicting every HTTP code); push tests against
+or missing acknowledgements, random BESS states of charge, with a shadow model predicting every
+HTTP code); push tests against
 a real server; performance tests. Every test family was verified against deliberate bugs.
 
 **Figures** (2017 MacBook Pro, native release build): an event on one charger reaches another
@@ -41,10 +43,11 @@ charger's WebSocket in under 0.7 ms (the requirement is 1 s); about 5,000 events
 concurrent burst with the safety invariant checked on every response.
 
 **Assumptions.** Power modelled in kW, continuously divisible (no stacks); one server per
-station; a setpoint received is applied at once; state in memory; no authentication.
+station; a setpoint received is applied at once; state in memory; no authentication. BESS: the
+SoC is an input from the BMS; the BESS applies its mode at once and never exports.
 
-**Next.** A timeout for a charger that never acknowledges; battery storage (BESS); minimum
-viable power per session.
+**Next.** A timeout for a charger that never acknowledges; hysteresis around the BESS SoC
+floor; minimum viable power per session.
 
 ---
 
@@ -956,3 +959,64 @@ fields).
 - **Minimum viable power per session: documented as not covered** (README limitations), with
   the sketched rule. It cannot be a scenario since the feature does not exist; not needed for
   the brief's station.
+
+
+---
+
+# V4 — Battery storage (BESS)
+
+## Step 17 — BESS design (2026-10-21)
+
+**Brief**: boost the station's capacity with the battery, keep its SoC above 10 %, charge it
+with spare grid power.
+
+**Product input (PM)**: the SoC is reported by the BESS's BMS, as a vehicle reports its demand;
+the station must **never export** to the public grid, not even briefly; the 10 % floor must be
+the system's own rule, above the BMS hardware cut-off, so the boost never vanishes without
+warning; one flow at a time (charge, discharge or idle), decided on every recomputation; the BESS
+is the station's own asset and can be treated as a planning input that applies its mode reliably.
+
+**Decisions**
+
+- **SoC as an input** (`POST /bess`): no timer, no energy integration; the system stays
+  event-driven, and the BESS speaks first, so HTTP.
+- **Capacity instead of grid**: `capacity = grid + max_kw` above 10 % SoC, `grid` otherwise or
+  while unknown. The allocator is unchanged; it only receives a larger capacity.
+- **Mode rule**: discharge what vehicles draw beyond the grid; else charge with the headroom up to
+  `max_kw` while not full (vehicles first); else idle.
+- **No acknowledgement for the BESS.** Commanding its power from the server would make boost
+  transitions unsafe either way (vehicles first: overload; BESS first: export). The BESS
+  regulates the grid connection locally (peak shaving); the server plans capacity and mode, and
+  vehicle setpoints keep going through the barrier. When the SoC falls below the floor, vehicle
+  decreases are published at once and the BESS covers them until applied.
+- Kept minimal: the 10 % floor is a constant; no hysteresis (documented); SoC updates recorded in
+  `/events` (kind `bess_soc`), which makes a history entry's charger optional.
+
+## Step 18 — V4.1: model, API, scenarios (2026-10-21)
+
+**Scope**: `src/model.rs` (`Bess` config, `soc`, `set_soc`, `boost_w`, `capacity_w`,
+`bess_flow`), `src/allocator.rs` (takes the capacity), `src/api.rs` (`POST /bess`,
+`capacity_kw`, `grid_import_kw`, `bess` block), checks (safety and transition on the capacity;
+grid import within 0..=grid; BESS mode rule), runner (`soc` step, BESS expectations), scenarios
+S23–S25.
+
+- A station without BESS behaves exactly as before: the 22 existing scenarios pass unchanged.
+- `available_kw = grid − allocated` would have overflowed in unsigned integers once the boost is
+  used; it is now `capacity − allocated` (saturating while vehicles apply a lower capacity).
+- Deliberate bugs caught: floor ignored (S24), charging that ignores the vehicles (grid import
+  500 kW on a 400 kW grid).
+
+## Step 19 — V4.2: randomized BESS, documentation (2026-10-21)
+
+- **Randomized test**: one station in two has a BESS (50–400 kWh, 20–300 kW); random SoC reports
+  (floor, full, in between, out of range → 422, no BESS → 404). Passes on 500 stations.
+- A first failure came from the check, not the server: a 1 W remainder of the floor rounding is
+  real headroom, so the BESS charges 1 W, while the check decided the mode with its 1 W
+  comparison tolerance. The mode is now decided on exact values; the tolerance only compares
+  powers.
+- **Floor rule now checked everywhere** (`capacity = grid + boost`, boost only above 10 %): the
+  randomized test catches a floor ignored, charging that ignores the vehicles, and charging
+  when full.
+- README: a "Battery storage (BESS)" section (rules, interface, why no acknowledgement,
+  assumptions), API and `/status` fields, OPS view, scenarios S23–S25, metrics, limitations,
+  roadmap (V4 ✅).

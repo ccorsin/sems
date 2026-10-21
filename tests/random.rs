@@ -8,7 +8,8 @@
 //! connector) predicts the HTTP code of every request.
 //!
 //! Acknowledgements are random steps too: late, twice, stale, for a future version, for an
-//! unknown charger, or never. Checked after each step: expected code (never a 5xx), safety,
+//! unknown charger, or never. One station in two has a BESS whose state of charge is reported at
+//! random (floor, full, anything in between, out of range; 404 without BESS). Checked after each step: expected code (never a 5xx), safety,
 //! transition, history, `/status` consistency, shadow agreement, and no waste beyond rounding
 //! (< 1 W per session) whenever the station is settled. Each run ends with every charger
 //! acknowledging, which must settle the station with no waste. A stale acknowledgement must not
@@ -76,7 +77,7 @@ async fn random_stations_and_events() {
 }
 
 /// Random station: 1–5 chargers of 7–350 kW, 1–3 connectors (some with a lower limit),
-/// grid of 10–1500 kW.
+/// grid of 10–1500 kW, and one station in two with a BESS of 50–400 kWh and 20–300 kW.
 fn random_config(rng: &mut Rng) -> Value {
     let chargers: Vec<Value> = (1..=1 + rng.below(5))
         .map(|c| {
@@ -90,7 +91,12 @@ fn random_config(rng: &mut Rng) -> Value {
             json!({ "id": format!("CP{c}"), "max_kw": max_kw, "connectors": connectors })
         })
         .collect();
-    json!({ "grid_kw": 10 + rng.below(1491), "chargers": chargers })
+    let mut config = json!({ "grid_kw": 10 + rng.below(1491), "chargers": chargers });
+    if rng.chance(50) {
+        let bess = json!({ "capacity_kwh": 50 + rng.below(351), "max_kw": 20 + rng.below(281) });
+        config["bess"] = bess;
+    }
+    config
 }
 
 async fn run(seed: u64) -> Result<(), String> {
@@ -196,7 +202,7 @@ async fn run(seed: u64) -> Result<(), String> {
             // Acknowledgements arrive late, in any order, twice, stale, or never: mostly the
             // charger's latest version, sometimes an older one, a future one, or an unknown
             // charger.
-            _ => {
+            70..90 => {
                 let c = rng.below(slots.len() as u64) as usize;
                 let unknown = rng.chance(5);
                 let charger = if unknown {
@@ -225,6 +231,33 @@ async fn run(seed: u64) -> Result<(), String> {
                     request,
                     expected,
                     "ack",
+                    None,
+                )
+            }
+            // The BMS reports a state of charge: mostly valid (floor and full included),
+            // sometimes out of range; a station without BESS answers 404.
+            _ => {
+                let soc = match rng.below(100) {
+                    0..10 => 0.10,
+                    10..20 => 1.0,
+                    20..90 => rng.below(1001) as f64 / 1000.0,
+                    _ => [-0.1, 1.5][rng.below(2) as usize],
+                };
+                let expected = if config["bess"].is_null() {
+                    404
+                } else if (0.0..=1.0).contains(&soc) {
+                    200
+                } else {
+                    422
+                };
+                let request = test::TestRequest::post()
+                    .uri("/bess")
+                    .set_json(json!({ "soc": soc }));
+                (
+                    format!("bess soc {soc}"),
+                    request,
+                    expected,
+                    "bess_soc",
                     None,
                 )
             }
