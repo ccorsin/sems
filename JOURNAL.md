@@ -472,3 +472,44 @@ computation: latency will be dominated by the network, as expected.
   one fails, and the report lists every failure.
 - **`status_since_ms` not checked by scenarios** (real clock), only status changes; exact values
   are covered by the model's unit tests with a controlled clock.
+
+---
+
+## Step 3 — V1, increment 3: Docker and minimal README (2026-10-21)
+
+**Scope**: `Dockerfile` (multi-stage), `docker-compose.yml`, `.dockerignore`, `README.md`.
+**First complete deliverable**: a reviewer with only Docker can run the server and the tests.
+
+```
+docker compose up --build        # server on :8080
+docker compose run --rm test     # unit tests + scenarios
+```
+
+**Result** (Docker Desktop on the 2017 MacBook Pro, 4 CPUs / 8 GB VM):
+
+| | |
+|---|---|
+| First build of both images | 5 min 24 s |
+| Rebuild after a source change | 12 s (dependency layers cached) |
+| Runtime image | 26.7 MB, runs as non-root (uid 65532) |
+| Test image | 1.76 GB (full Rust toolchain, only built for `test`) |
+| Tests in Docker | 17 unit tests + 15 scenarios pass |
+| Smoke test | `curl` against the container: 201, 300 kW then 200/200 kW, log lines visible with `docker compose logs` |
+
+**Choices**
+
+- **Stages**: `base` (dummy crate) → `builder` (release) and `tester` (debug, so the
+  `debug_assert!` invariant is active), → `runtime` (default target). BuildKit only builds the
+  stages a target needs: `docker compose up` never builds the test image.
+- **Dependency caching**: dependencies are compiled against a dummy `main.rs` / `lib.rs` before
+  the sources are copied; `touch` makes cargo rebuild the real crate afterwards.
+- **Runtime image `gcr.io/distroless/cc-debian12:nonroot`** (chosen over `debian:bookworm-slim`):
+  no shell, non-root user, ~27 MB. Debugging goes through logs and the API.
+- **Builder pinned to `rust:1.96-slim-bookworm`**: same compiler as the dev machine, and Debian 12
+  like the runtime (glibc compatibility).
+- **`ENTRYPOINT ["/sems"]` + `CMD ["/config/station.json"]`**: another config path can be passed
+  without redefining the entry point; another station is a mounted file.
+- **Test service behind a compose profile**: `docker compose up` starts the server only.
+- **README is minimal on purpose**: quick start, tests, scenarios, API, key decisions,
+  limitations, performance, roadmap. The full architecture/trade-offs section comes at the end
+  of V1; `JOURNAL.md` holds the detailed reasoning meanwhile.
