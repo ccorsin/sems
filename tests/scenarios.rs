@@ -56,6 +56,8 @@ struct Step {
     /// Alias of the session to end.
     disconnect: Option<String>,
     ack: Option<Ack>,
+    /// BESS state of charge reported by its BMS (0..=1).
+    soc: Option<f64>,
     #[serde(default)]
     expect: Expect,
 }
@@ -102,6 +104,11 @@ struct Expect {
     allocated_kw: Option<f64>,
     available_kw: Option<f64>,
     unserved_kw: Option<f64>,
+    capacity_kw: Option<f64>,
+    grid_import_kw: Option<f64>,
+    /// `charging`, `discharging` or `idle`.
+    bess_mode: Option<String>,
+    bess_kw: Option<f64>,
 }
 
 #[actix_web::test]
@@ -190,40 +197,49 @@ async fn run(scenario: &Scenario) -> Result<Metrics, String> {
     for (i, step) in scenario.steps.iter().enumerate() {
         let at = |e: String| format!("step {}: {e}", i + 1);
 
-        let request: Option<Request> =
-            match (&step.connect, &step.change, &step.disconnect, &step.ack) {
-                (Some(c), None, None, None) => Some((
-                    test::TestRequest::post().uri("/sessions").set_json(json!({
-                        "charger": c.charger, "connector": c.connector, "demand_kw": c.demand_kw
-                    })),
-                    "session_started",
-                )),
-                (None, Some(c), None, None) => Some((
-                    test::TestRequest::put()
-                        .uri(&format!("/sessions/{}", id_of(&sessions, &c.session)))
-                        .set_json(json!({ "demand_kw": c.demand_kw })),
-                    "demand_changed",
-                )),
-                (None, None, Some(alias), None) => Some((
-                    test::TestRequest::delete()
-                        .uri(&format!("/sessions/{}", id_of(&sessions, alias))),
-                    "session_ended",
-                )),
-                (None, None, None, Some(Ack::Exact { charger, version })) => {
-                    Some(ack_request(charger, *version))
-                }
-                (None, None, None, Some(Ack::Latest(charger))) => {
-                    let version = status["chargers"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|c| c["id"] == charger.as_str())
-                        .map_or(0, |c| c["version"].as_u64().unwrap_or(0));
-                    Some(ack_request(charger, version))
-                }
-                (None, None, None, None) => None,
-                _ => return Err(at("a step holds at most one request".into())),
-            };
+        let soc = step.soc.map(|soc| -> Request {
+            let request = test::TestRequest::post().uri("/bess");
+            (request.set_json(json!({ "soc": soc })), "bess_soc")
+        });
+        let request: Option<Request> = match (
+            &step.connect,
+            &step.change,
+            &step.disconnect,
+            &step.ack,
+            soc,
+        ) {
+            (Some(c), None, None, None, None) => Some((
+                test::TestRequest::post().uri("/sessions").set_json(json!({
+                    "charger": c.charger, "connector": c.connector, "demand_kw": c.demand_kw
+                })),
+                "session_started",
+            )),
+            (None, Some(c), None, None, None) => Some((
+                test::TestRequest::put()
+                    .uri(&format!("/sessions/{}", id_of(&sessions, &c.session)))
+                    .set_json(json!({ "demand_kw": c.demand_kw })),
+                "demand_changed",
+            )),
+            (None, None, Some(alias), None, None) => Some((
+                test::TestRequest::delete().uri(&format!("/sessions/{}", id_of(&sessions, alias))),
+                "session_ended",
+            )),
+            (None, None, None, Some(Ack::Exact { charger, version }), None) => {
+                Some(ack_request(charger, *version))
+            }
+            (None, None, None, Some(Ack::Latest(charger)), None) => {
+                let version = status["chargers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["id"] == charger.as_str())
+                    .map_or(0, |c| c["version"].as_u64().unwrap_or(0));
+                Some(ack_request(charger, version))
+            }
+            (None, None, None, None, Some(soc)) => Some(soc),
+            (None, None, None, None, None) => None,
+            _ => return Err(at("a step holds at most one request".into())),
+        };
 
         // The step's request first, then (auto mode) the acknowledgements it calls for. Every
         // request is followed by the full set of checks, so intermediate states are verified.
@@ -437,9 +453,20 @@ fn check_expect(
         ("allocated_kw", expect.allocated_kw),
         ("available_kw", expect.available_kw),
         ("unserved_kw", expect.unserved_kw),
+        ("capacity_kw", expect.capacity_kw),
+        ("grid_import_kw", expect.grid_import_kw),
     ] {
         if let Some(want) = want {
             close(field, num(&status[field]), want)?;
+        }
+    }
+    if let Some(want) = expect.bess_kw {
+        close("bess power", num(&status["bess"]["power_kw"]), want)?;
+    }
+    if let Some(want) = &expect.bess_mode {
+        let got = &status["bess"]["mode"];
+        if got != want.as_str() {
+            return Err(format!("bess mode: expected {want}, got {got}"));
         }
     }
 

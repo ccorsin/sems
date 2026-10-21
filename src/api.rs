@@ -20,7 +20,9 @@
 //! then written after it is released. Publishing to the `watch` channels is in-memory and done
 //! under the lock, so concurrent events are published in the order they were applied.
 
-use crate::model::{kw_to_w, EventError, EventKind, Record, Station, Status, Watts, MAX_KW};
+use crate::model::{
+    kw_to_w, BessMode, EventError, EventKind, Record, Station, Status, Watts, MAX_KW, MIN_SOC,
+};
 use actix_web::{
     dev::Server, error::InternalError, http::header, http::StatusCode, web, App, HttpRequest,
     HttpResponse, HttpServer,
@@ -80,7 +82,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/status", web::get().to(status))
         .route("/events", web::get().to(events))
         .route("/chargers/{id}/setpoints", web::get().to(setpoints))
-        .route("/chargers/{id}/ack", web::post().to(ack));
+        .route("/chargers/{id}/ack", web::post().to(ack))
+        .route("/bess", web::post().to(bess));
 }
 
 /// Current time in milliseconds since the Unix epoch.
@@ -151,6 +154,19 @@ async fn ack(state: AppState, id: web::Path<String>, body: web::Json<Ack>) -> Ht
     let label = format!("ack charger={id} version={}", body.version);
     run_event(&state, StatusCode::OK, &label, |st, now| {
         st.ack(&id, body.version, now).map(|()| None)
+    })
+}
+
+#[derive(Deserialize)]
+struct BessReport {
+    soc: f64,
+}
+
+/// The BESS reports its state of charge (0..=1). Like a charger, it speaks first: HTTP.
+async fn bess(state: AppState, body: web::Json<BessReport>) -> HttpResponse {
+    let label = format!("bess_soc soc={}", body.soc);
+    run_event(&state, StatusCode::OK, &label, |st, now| {
+        st.set_soc(body.soc, now).map(|()| None)
     })
 }
 
@@ -344,6 +360,11 @@ fn event_error(e: EventError) -> HttpResponse {
             StatusCode::UNPROCESSABLE_ENTITY,
             "this version was never sent",
         ),
+        EventError::NoBess => error(StatusCode::NOT_FOUND, "this station has no BESS"),
+        EventError::InvalidSoc => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "soc must be between 0 and 1",
+        ),
     }
 }
 
@@ -363,11 +384,13 @@ struct EventView {
     at_ms: u64,
     kind: EventKind,
     session_id: Option<Uuid>,
-    charger: String,
+    charger: Option<String>,
     connector: Option<u32>,
     demand_kw: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    soc: Option<f64>,
     result: ResultView,
 }
 
@@ -385,16 +408,20 @@ struct SessionSetpoint {
 
 impl EventView {
     fn of(st: &Station, r: &Record) -> Self {
-        let charger = &st.config.chargers[r.charger];
+        let charger = r.charger.map(|c| &st.config.chargers[c]);
         EventView {
             seq: r.seq,
             at_ms: r.at_ms,
             kind: r.kind,
             session_id: r.session.map(|(id, _, _)| id),
-            charger: charger.id.clone(),
-            connector: r.session.map(|(_, k, _)| charger.connectors[k].id),
+            charger: charger.map(|c| c.id.clone()),
+            connector: r
+                .session
+                .zip(charger)
+                .map(|((_, k, _), c)| c.connectors[k].id),
             demand_kw: r.session.map(|(_, _, w)| kw(w)),
             version: r.version,
+            soc: r.soc,
             result: ResultView {
                 allocated_kw: kw(r.setpoints.iter().map(|(_, w)| w).sum()),
                 setpoints: r
@@ -464,15 +491,36 @@ struct EventResponse {
 #[derive(Serialize)]
 struct StatusView {
     grid_kw: f64,
+    /// Power offered to vehicles: the grid plus the BESS boost.
+    capacity_kw: f64,
     /// Sum of setpoints.
     allocated_kw: f64,
-    /// Grid headroom; not necessarily usable (a charger may be saturated).
+    /// Capacity headroom; not necessarily usable (a charger may be saturated).
     available_kw: f64,
     /// Demand not served: Σ (demand − setpoint).
     unserved_kw: f64,
+    /// Drawn from the grid: vehicles minus BESS discharge plus BESS charge, within 0..=grid.
+    grid_import_kw: f64,
     /// Chargers whose acknowledgement is awaited: while not empty, increases are held.
     pending_acks: Vec<PendingAck>,
+    /// `null` when the station has no BESS.
+    bess: Option<BessView>,
     chargers: Vec<ChargerView>,
+}
+
+#[derive(Serialize)]
+struct BessView {
+    capacity_kwh: f64,
+    max_kw: f64,
+    /// As last reported by the BMS (`null` until then).
+    soc: Option<f64>,
+    mode: BessMode,
+    /// Power of the current flow (charge or discharge).
+    power_kw: f64,
+    /// Power it adds to the capacity: its maximum above the SoC floor, 0 otherwise.
+    boost_kw: f64,
+    /// Energy it can still deliver before the SoC floor.
+    energy_above_floor_kwh: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -568,11 +616,33 @@ impl StatusView {
                 }
             })
             .collect();
+        let (mode, flow_w) = st.bess_flow().unwrap_or((BessMode::Idle, 0));
+        let grid_import_w = match mode {
+            BessMode::Discharging => allocated_w - flow_w,
+            BessMode::Charging => allocated_w + flow_w,
+            BessMode::Idle => allocated_w,
+        };
+        let bess = st.config.bess.map(|b| BessView {
+            capacity_kwh: kw(b.capacity_wh),
+            max_kw: kw(b.max_w),
+            soc: st.soc,
+            mode,
+            power_kw: kw(flow_w),
+            boost_kw: kw(st.boost_w()),
+            energy_above_floor_kwh: st
+                .soc
+                .map(|soc| (soc - MIN_SOC).max(0.0) * kw(b.capacity_wh)),
+        });
         StatusView {
             grid_kw: kw(st.config.grid_w),
+            capacity_kw: kw(st.capacity_w()),
             allocated_kw: kw(allocated_w),
-            available_kw: kw(st.config.grid_w - allocated_w),
+            // Saturating: right after the boost disappears, vehicles may still hold the setpoints
+            // of the larger capacity until they apply their decreases (the BESS covers meanwhile).
+            available_kw: kw(st.capacity_w().saturating_sub(allocated_w)),
             unserved_kw: kw(unserved_w),
+            grid_import_kw: kw(grid_import_w),
+            bess,
             pending_acks: st
                 .awaited()
                 .map(|c| PendingAck {
@@ -629,6 +699,19 @@ mod tests {
             (test::TestRequest::delete().uri("/sessions/not-a-uuid"), 404),
             (test::TestRequest::get().uri("/events?session=nope"), 422),
             (test::TestRequest::get().uri("/events?limit=-1"), 422),
+            // This station has no BESS.
+            (
+                test::TestRequest::post()
+                    .uri("/bess")
+                    .set_json(json!({ "soc": 0.5 })),
+                404,
+            ),
+            (
+                test::TestRequest::post()
+                    .uri("/bess")
+                    .set_json(json!({ "soc": "half" })),
+                422,
+            ),
         ];
         for (req, code) in cases {
             let res = test::call_service(&app, req.to_request()).await;

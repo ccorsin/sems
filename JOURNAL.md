@@ -28,23 +28,27 @@ the allocation that resulted from it.
 | V2 | Max-min fair water-filling, first inside each charger, then across the grid | 0 kW unused in every scenario; end-to-end latency unchanged |
 | V3.1 | Decrease before increase: decreases are published at once; increases wait until every charger with a pending decrease acknowledges its latest version (`POST /chargers/{id}/ack`, version = event `seq`) | 0 kW of transition overshoot on every transition; a charger that never acknowledges freezes increases (documented limitation) |
 | V3.2 | OPS view completed: each charger's `online` status (a setpoint WebSocket is open) with `online_since_ms`, and available power per charger | Every item the brief lists for OPS is in `/status`; going offline releases nothing |
+| V4 | Optional BESS: capacity = grid + its power above a 10 % SoC (reported by the BMS); one flow at a time (discharge the excess, else charge the headroom, else idle); the BESS regulates the grid connection locally | Vehicles get up to the BESS power on top of the grid; the grid import stays within 0..=grid, never an export |
 
-**Tests.** Unit tests on configuration, model and allocator; 22 declarative JSON scenarios, each
+**Tests.** Unit tests on configuration, model and allocator; 25 declarative JSON scenarios, each
 with its `why`, replayed through the API with four properties checked after every request
 (safety, transition, history, consistency) and allocation metrics per scenario; a seeded
 randomized test (random stations and events, including invalid requests and late, stale, future
-or missing acknowledgements, with a shadow model predicting every HTTP code); push tests against
+or missing acknowledgements, random BESS states of charge, with a shadow model predicting every
+HTTP code); push tests against
 a real server; performance tests. Every test family was verified against deliberate bugs.
 
-**Figures** (2017 MacBook Pro, native release build): an event on one charger reaches another
-charger's WebSocket in under 0.7 ms (the requirement is 1 s); about 5,000 events/s under a
-concurrent burst with the safety invariant checked on every response.
+**Figures** (release build inside the Docker container): from an event until every affected
+charger holds its final setpoint, acknowledgement cascade included, about 2–3 ms typically and
+31 ms at worst (the requirement is 1 s); about 3,000 events/s under a concurrent burst with the
+safety invariant checked on every response.
 
 **Assumptions.** Power modelled in kW, continuously divisible (no stacks); one server per
-station; a setpoint received is applied at once; state in memory; no authentication.
+station; a setpoint received is applied at once; state in memory; no authentication. BESS: the
+SoC is an input from the BMS; the BESS applies its mode at once and never exports.
 
-**Next.** A timeout for a charger that never acknowledges; battery storage (BESS); minimum
-viable power per session.
+**Next.** A timeout for a charger that never acknowledges; hysteresis around the BESS SoC
+floor; minimum viable power per session.
 
 ---
 
@@ -213,19 +217,7 @@ reviewer), `curl` scripts (no assertions) and Hurl (an extra tool, no WebSocket 
 reconsidered later). Server-generated UUIDs are referenced through aliases (`"as": "A"`). The
 `why` field is mandatory.
 
-```json
-{
-  "name": "two_vehicles_same_charger",
-  "why": "Local contention: two sessions on one charger share its 300 kW even though the grid has headroom.",
-  "config": { "grid_kw": 400, "chargers": [ { "id": "CP1", "max_kw": 300, "connectors": [ {"id": 1}, {"id": 2} ] },
-                                            { "id": "CP2", "max_kw": 300, "connectors": [ {"id": 1}, {"id": 2} ] } ] },
-  "steps": [
-    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 }, "expect": { "A": 300 } },
-    { "connect": { "as": "B", "charger": "CP1", "connector": 2, "demand_kw": 300 }, "expect": { "A": 150, "B": 150, "allocated_kw": 300 } },
-    { "disconnect": "A", "expect": { "B": 300 } }
-  ]
-}
-```
+The final format is documented in the README ("Scenarios").
 
 In V1, behaviour depends only on the **order** of events, not on their timing. A simulated clock
 (`"advance_time"` step) will be added with the BESS (V4), where SoC evolves over time.
@@ -309,133 +301,11 @@ optimum = min( grid, Σ_chargers min( charger_max, Σ_sessions min(demand, conne
 
 ## V1 specifications
 
-### Running
-
-```
-sems <path/config.json>          # listens on 0.0.0.0:8080
-docker run -p <port>:8080 -v ./config:/config sems /config/station.json
-```
-
-The config is **validated at startup**. On error, the server prints a clear message and exits.
-Detected errors: duplicate IDs, power ≤ 0, connector more powerful than its charger, charger
-without connectors.
-
-### Configuration
-
-```json
-{
-  "grid_kw": 400,
-  "chargers": [
-    { "id": "CP1", "max_kw": 300,
-      "connectors": [ { "id": 1, "type": "CCS" }, { "id": 2, "type": "CCS", "max_kw": 150 } ] }
-  ]
-}
-```
-
-- `connectors[].max_kw` is optional; it defaults to the charger's `max_kw`.
-- `type` is informational and has no effect on allocation.
-
-### Exposed quantities
-
-| Field | Level | Meaning |
-|---|---|---|
-| `demand_kw` | session | What the vehicle requests (input) |
-| `setpoint_kw` | session | What the system allows (output), always ≤ `demand_kw` |
-| `allocated_kw` | charger, station | Sum of setpoints |
-| `available_kw` | station | `grid_kw − allocated_kw` (grid headroom, not necessarily usable: a charger may be saturated) |
-| `unserved_kw` | charger, station | `Σ (demand − setpoint)`: unmet demand. OPS diagnostics. |
-
-### Events (chargers → server)
-
-| Method | Route | Body | Success | Errors |
-|---|---|---|---|---|
-| `POST` | `/sessions` | `{"charger": "CP1", "connector": 1, "demand_kw": 150}` | `201` + response below | 404 unknown charger/connector, 409 connector busy, 422 invalid demand (< 0) |
-| `PUT` | `/sessions/{id}` | `{"demand_kw": 80}` | `200` + response below | 404, 422 |
-| `DELETE` | `/sessions/{id}` | — | `200` + response below | 404 |
-
-Response: `{"session_id": "…", "setpoint_kw": 150, "status": { /* full state, see GET /status */ }}`.
-Returning the full station state to a charger is a **convenience for the demo and tests**: in a
-real system a charger should only see its own setpoints. Documented as such.
-
-A demand of 0 kW is valid (vehicle full but still plugged in). Errors have the form
-`{"error": "human-readable message"}`.
-
-The WebSocket push and the HTTP response travel on two channels, so their arrival order is not
-guaranteed; both carry the same values.
-
-### Queries (OPS)
-
-**`GET /status`** (also embedded as `status` in every event response):
-
-```json
-{ "grid_kw": 400, "allocated_kw": 300, "available_kw": 100, "unserved_kw": 300,
-  "chargers": [
-    { "id": "CP1", "max_kw": 300, "allocated_kw": 300, "unserved_kw": 300,
-      "connectors": [
-        { "id": 1, "type": "CCS", "max_kw": 300,
-          "status": "charging", "status_since_ms": 1761040000000,
-          "session": { "id": "9f1c…", "started_at_ms": 1761040000000,
-                       "demand_kw": 300, "setpoint_kw": 150 } },
-        { "id": 2, "type": "CCS", "max_kw": 150,
-          "status": "available", "status_since_ms": 1761039000000, "session": null } ] } ] }
-```
-
-**Connector status** (names borrowed from OCPP). It tells OPS *why* a plugged-in vehicle is not
-charging: the vehicle does not ask for anything, or the station cannot give it anything.
-
-| `status` | Condition | Meaning for OPS | Version |
-|---|---|---|---|
-| `available` | no session | Free | V1 |
-| `charging` | setpoint > 0 | Charging | V1 |
-| `suspended_ev` | demand = 0 | Plugged in, the **vehicle** no longer requests power (battery full): candidate for idle fees | V1 |
-| `suspended_evse` | demand > 0, setpoint = 0 | Plugged in, the **station** cannot give it power | V3 (minimum power) |
-
-- The status is **derived** from demand and setpoint, never stored, so it cannot be inconsistent.
-- `status_since_ms` is the time of the last status change ("plugged in without charging for
-  45 min" is what OPS needs). Only that timestamp is stored.
-- Ended sessions are available in the history.
-
-**`GET /events?limit=100&session=<uuid>`**: the server keeps the last 10,000 events. `limit`
-defaults to 100; `session` is an optional filter. Each entry holds **the event and the resulting
-allocation**:
-
-```json
-{ "seq": 7, "at_ms": 1761040000000, "kind": "demand_changed",
-  "session_id": "9f1c…", "charger": "CP1", "connector": 1, "demand_kw": 80,
-  "result": { "allocated_kw": 230, "setpoints": [ { "session_id": "9f1c…", "kw": 80 } ] } }
-```
-
-`kind` values: `session_started`, `demand_changed`, `session_ended`.
-
-This format covers the OPS needs: per-session history (`?session=`), station history (the
-sequence of `allocated_kw`), and safety audit (`allocated_kw ≤ grid_kw` on every entry).
-
-### Push (server → chargers)
-
-**`GET /chargers/{id}/setpoints`** — *revised in increment 4, initially `/ws/chargers/{id}`*:
-with a WebSocket upgrade, the server sends the current setpoints, then one message whenever a
-setpoint of that charger changes; as a plain GET, it returns the current setpoints (pull
-fallback). Every connector is listed, free ones at 0 kW with `session_id: null`.
-
-```json
-{ "charger": "CP1", "setpoints": [ { "connector": 1, "session_id": "9f1c…", "kw": 150 } ] }
-```
-
-### Internal architecture
-
-```
-src/
-├─ main.rs       # startup: read config, start server
-├─ model.rs      # config, sessions, state (pure)
-├─ allocator.rs  # allocation algorithm (pure, no I/O)
-└─ api.rs        # HTTP and WebSocket routes
-```
-
-- `web::Data<Mutex<Station>>` (config + sessions, see increment 1) + one `tokio::sync::watch`
-  channel per charger for push.
-- No I/O under the lock.
-- Dependencies: `actix-web` (default features off), `actix-ws`, `serde`, `serde_json`, `uuid`.
-  In-memory API tests use `actix_web::test` (no extra dependency).
+Agreed before any code: routes, payloads, error codes, the `/status` and `/events` formats, the
+connector statuses (`available`, `charging`, `suspended_ev`, `suspended_evse`, derived from
+demand and setpoint, never stored) and the module layout (`model`, `allocator`, `api`, `main`).
+They are documented, as they stand today, in the README; deviations are recorded in the steps
+below.
 
 ---
 
@@ -956,3 +826,118 @@ fields).
 - **Minimum viable power per session: documented as not covered** (README limitations), with
   the sketched rule. It cannot be a scenario since the feature does not exist; not needed for
   the brief's station.
+
+---
+
+# V4 — Battery storage (BESS)
+
+## Step 17 — BESS design (2026-10-21)
+
+**Brief**: boost the station's capacity with the battery, keep its SoC above 10 %, charge it
+with spare grid power.
+
+**Product input (PM)**: the SoC is reported by the BESS's BMS, as a vehicle reports its demand;
+the station must **never export** to the public grid, not even briefly; the 10 % floor must be
+the system's own rule, above the BMS hardware cut-off, so the boost never vanishes without
+warning; one flow at a time (charge, discharge or idle), decided on every recomputation; the BESS
+is the station's own asset and can be treated as a planning input that applies its mode reliably.
+
+**Decisions**
+
+- **SoC as an input** (`POST /bess`): no timer, no energy integration; the system stays
+  event-driven, and the BESS speaks first, so HTTP.
+- **Capacity instead of grid**: `capacity = grid + max_kw` above 10 % SoC, `grid` otherwise or
+  while unknown. The allocator is unchanged; it only receives a larger capacity.
+- **Mode rule**: discharge what vehicles draw beyond the grid; else charge with the headroom up to
+  `max_kw` while not full (vehicles first); else idle.
+- **No acknowledgement for the BESS.** Commanding its power from the server would make boost
+  transitions unsafe either way (vehicles first: overload; BESS first: export). The BESS
+  regulates the grid connection locally (peak shaving); the server plans capacity and mode, and
+  vehicle setpoints keep going through the barrier. When the SoC falls below the floor, vehicle
+  decreases are published at once and the BESS covers them until applied.
+- Kept minimal: the 10 % floor is a constant; no hysteresis (documented); SoC updates recorded in
+  `/events` (kind `bess_soc`), which makes a history entry's charger optional.
+
+## Step 18 — V4.1: model, API, scenarios (2026-10-21)
+
+**Scope**: `src/model.rs` (`Bess` config, `soc`, `set_soc`, `boost_w`, `capacity_w`,
+`bess_flow`), `src/allocator.rs` (takes the capacity), `src/api.rs` (`POST /bess`,
+`capacity_kw`, `grid_import_kw`, `bess` block), checks (safety and transition on the capacity;
+grid import within 0..=grid; BESS mode rule), runner (`soc` step, BESS expectations), scenarios
+S23–S25.
+
+- A station without BESS behaves exactly as before: the 22 existing scenarios pass unchanged.
+- `available_kw = grid − allocated` would have overflowed in unsigned integers once the boost is
+  used; it is now `capacity − allocated` (saturating while vehicles apply a lower capacity).
+- Deliberate bugs caught: floor ignored (S24), charging that ignores the vehicles (grid import
+  500 kW on a 400 kW grid).
+
+## Step 19 — V4.2: randomized BESS, documentation (2026-10-21)
+
+- **Randomized test**: one station in two has a BESS (50–400 kWh, 20–300 kW); random SoC reports
+  (floor, full, in between, out of range → 422, no BESS → 404). Passes on 500 stations.
+- A first failure came from the check, not the server: a 1 W remainder of the floor rounding is
+  real headroom, so the BESS charges 1 W, while the check decided the mode with its 1 W
+  comparison tolerance. The mode is now decided on exact values; the tolerance only compares
+  powers.
+- **Floor rule now checked everywhere** (`capacity = grid + boost`, boost only above 10 %): the
+  randomized test catches a floor ignored, charging that ignores the vehicles, and charging
+  when full.
+- README: a "Battery storage (BESS)" section (rules, interface, why no acknowledgement,
+  assumptions), API and `/status` fields, OPS view, scenarios S23–S25, metrics, limitations,
+  roadmap (V4 ✅).
+
+## Step 20 — Critical review: decisions and known risks (2026-10-21)
+
+All tests rerun inside Docker (28 unit tests, 25 scenarios, randomized, push) and performance
+remeasured (P1 max 325–385 µs, P2 4,600–4,950 events/s).
+
+- **Panic while holding the lock: deliberate fail-safe**, documented with its reasoning (a broken
+  invariant must not keep granting power; chargers keep their last safe setpoints). Rollback per
+  event is the documented evolution.
+- **Stale SoC: known weakness, assumed.** A proper fix needs a watchdog timer (the system is
+  event-driven); the same watchdog would implement the charger acknowledgement timeout.
+- **Written as risks, not just limitations**: no authentication (spoofed acknowledgement or SoC
+  could affect physical safety), the BESS not measured at the grid connection.
+- **Silent charger** reworded: current behaviour, limitation, next step. Starvation of increases
+  and hysteresis around the SoC floor documented as improvements. Restart: not handled.
+
+## Step 21 — P4: end-to-end latency per event type (2026-10-21)
+
+The < 1 s requirement covers the whole cascade, not the request alone. P4 measures, for connect,
+disconnect, demand down and demand up, with and without cascade, the time from the event until
+every affected charger holds its final setpoint, acknowledgement round trips included, with
+simulated chargers that acknowledge on reception. Typical cost about 2 ms; worst case observed
+268 ms; always far below 1 s (asserted).
+
+A first version failed intermittently: each helper call opened a new HTTP connection, and the
+thousands of connections left in TIME_WAIT exhausted the laptop's TCP ports. P4 now shares one
+client (connection reuse). A test-side fix; the server was not involved.
+
+- Added a **full-station case** (3 → 4 sessions, both chargers decrease and must acknowledge before
+  the fourth vehicle gets 100 kW) and an "active sessions" column: median about 2 ms, worst case
+  377 ms observed.
+- **P1 removed** (event → decrease pushed to another charger): P4 measures the same first link
+  and the rest of the cascade. Historical P1 maxima: V1 444–582 µs, V2 408–513 µs, V3 404–642 µs,
+  V4 325–385 µs. Kept: P2 (the only concurrency test, safety invariant under load) and P3
+  (allocator scaling).
+
+## Step 22 — Atomicity documented, by construction (2026-10-21)
+
+The single `Mutex<Station>` is required: actix-web runs one worker per core, and the global
+invariant "Σ ≤ grid" needs each event in one locked section. `std::sync::Mutex` fits:
+microsecond sections, never held across an `.await`. Rust rules out data races, not a critical
+section split in two: atomicity comes from the design (one locked section per event, readers on
+the same lock, validate before mutating). A dedicated concurrency test was written, then removed
+for simplicity: the property is documented as a checked property, covered by S11, the history
+property, the randomized test and the burst test P2.
+
+## Step 23 — Station configuration made explicit (2026-10-21)
+
+The system already read the station from a JSON file given at startup, validated it and failed
+fast on errors, but this was neither documented nor easy to demonstrate. Added: a "Station
+configuration" README section (format, defaults, validation, examples), a second example
+`config/station_bess.json` (heterogeneous chargers and a BESS), and `SEMS_CONFIG` in
+`docker-compose.yml` to start any station. Checked in the container: both examples start, an
+invalid file is refused at startup with its message. Also a table of contents at the top of the
+README.

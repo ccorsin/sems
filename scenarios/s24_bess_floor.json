@@ -1,0 +1,19 @@
+{
+  "name": "S24 BESS state-of-charge floor",
+  "why": "Anti over-discharge: when the BMS reports a SoC below 10 %, the station stops counting on the boost before the BMS hardware cut-off. Vehicles drop back to the grid's 200 kW each (decreases first, the BESS covering meanwhile), the BESS idles, and the boost returns once the SoC is above the floor again.",
+  "config": { "grid_kw": 400, "chargers": [
+    { "id": "CP1", "max_kw": 300, "connectors": [ { "id": 1 }, { "id": 2 } ] },
+    { "id": "CP2", "max_kw": 300, "connectors": [ { "id": 1 }, { "id": 2 } ] } ],
+    "bess": { "capacity_kwh": 200, "max_kw": 200 } },
+  "steps": [
+    { "soc": 0.5 },
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 300, "B": 300 }, "bess_mode": "discharging", "bess_kw": 200 } },
+    { "soc": 0.09,
+      "expect": { "setpoints": { "A": 200, "B": 200 }, "capacity_kw": 400, "bess_mode": "idle", "bess_kw": 0,
+                  "grid_import_kw": 400 } },
+    { "soc": 0.11,
+      "expect": { "setpoints": { "A": 300, "B": 300 }, "capacity_kw": 600, "bess_mode": "discharging", "bess_kw": 200 } }
+  ]
+}

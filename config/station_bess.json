@@ -1,0 +1,9 @@
+{
+  "grid_kw": 250,
+  "chargers": [
+    { "id": "HPC1", "max_kw": 300, "connectors": [ { "id": 1, "type": "CCS" }, { "id": 2, "type": "CCS", "max_kw": 150 } ] },
+    { "id": "DC50", "max_kw": 50, "connectors": [ { "id": 1, "type": "CCS" } ] },
+    { "id": "AC22", "max_kw": 22, "connectors": [ { "id": 1, "type": "Type2" }, { "id": 2, "type": "Type2" } ] }
+  ],
+  "bess": { "capacity_kwh": 200, "max_kw": 150 }
+}

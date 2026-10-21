@@ -1,13 +1,14 @@
-# docker compose up --build        → the server on http://localhost:8080
+# docker compose up --build        → the server on http://localhost:8080 (the brief's station)
+# SEMS_CONFIG=./config/station_bess.json docker compose up --build   → another station
 # docker compose run --rm test     → unit tests + scenarios
 services:
   sems:
     build: .
     ports:
       - "8080:8080"
-    # Another station: mount its config instead of the brief's one.
-    # volumes:
-    #   - ./my-station.json:/config/station.json:ro
+    # The station is described by a JSON file, mounted where the server reads it.
+    volumes:
+      - ${SEMS_CONFIG:-./config/station.json}:/config/station.json:ro
 
   test:
     build:
