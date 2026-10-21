@@ -6,7 +6,7 @@
 //! follows the same path.
 
 use crate::allocator::{allocate, Demand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Power in watts.
@@ -140,7 +140,8 @@ pub struct Session {
 
 /// Connector status, derived from its session (names borrowed from OCPP).
 /// Tells OPS whether a plugged-in vehicle is idle because of itself or because of the station.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     /// No vehicle.
     Available,

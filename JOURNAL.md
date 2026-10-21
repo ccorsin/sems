@@ -53,7 +53,7 @@ the BESS (tracking SoC over time).
 |---|---|---|
 | Language | Rust | — |
 | Dev machine | 2017 MacBook Pro: no `brew` installs, lean dependencies | — |
-| HTTP stack | `axum` + `tokio` + `serde` | `tiny_http` (lighter but less standard); std only (too much hand-written code). **Measured**: 87 crates, 49 s first build, ~1 s incremental, 839 KB release binary. Acceptable. |
+| HTTP stack | `actix-web` (default features off, `macros` only) + `actix-ws` + `serde` — *revised before increment 2, initially `axum`* | `axum`: equivalent for our needs and lighter to build, but the developer already masters actix-web, and "understand every line" matters more than build time at equal runtime performance. `tiny_http` (less standard); std only (too much hand-written code). **Measured** on the dev machine (first debug build / incremental / release build / release binary): axum + ws 87 crates, 49 s / 1 s / 53 s / 0.8 MB; actix-web default features 187 crates, 96 s / 2.2 s / 140 s / 4.8 MB; **actix-web without default features** (no compression, cookies, HTTP/2) **155 crates, 59 s / 1.5 s / 77 s / 2.2 MB**. Acceptable. |
 | Triggers | HTTP REST requests as input | OCPP/WebSocket, MQTT, Modbus, gRPC: realistic but oversized for the assignment. Cited as targets in the README. |
 | Setpoints to chargers | **WebSocket push** from V1 (hybrid: REST in, WS out) | Pull (latency depends on the polling interval); SSE (one-way, further from OCPP); full WebSocket à la OCPP (cannot be tested with `curl`); webhook, gRPC, MQTT (too heavy). |
 | State | In memory: immutable `Arc<Config>` + `Mutex<State>` | `RwLock` (negligible gain); `tokio::Mutex` (useless without `.await` under the lock); actor (more code, possible migration if the BESS requires it); `ArcSwap`, Redis (oversized). A **single** lock, because the "Σ ≤ grid" invariant is global. |
@@ -386,10 +386,11 @@ src/
 └─ api.rs        # HTTP and WebSocket routes
 ```
 
-- `Arc<Config>` (immutable) + `Mutex<State>` (sessions, history) + one `tokio::sync::watch`
+- `web::Data<Mutex<Station>>` (config + sessions, see increment 1) + one `tokio::sync::watch`
   channel per charger for push.
 - No I/O under the lock.
-- Dependencies: `axum` (`ws` feature), `tokio`, `serde`, `serde_json`, `uuid`.
+- Dependencies: `actix-web` (default features off), `actix-ws`, `serde`, `serde_json`, `uuid`.
+  In-memory API tests use `actix_web::test` (no extra dependency).
 
 ---
 
@@ -424,3 +425,50 @@ cargo run -- config/station.json   # station: grid 400 kW, 2 chargers, 4 connect
   mutation, reallocates, and stamps `status_since_ms` only where the derived status changed.
 - **Sessions are found by linear scan**: a station has a handful of connectors; a map
   `id → slot` would add a structure to keep in sync for no measurable gain.
+
+---
+
+## Step 2 — V1, increment 2: REST API, scenarios, allocator performance (2026-10-21)
+
+**Scope**: `src/api.rs` (routes, kW ↔ W conversion, error mapping, `/status`), `src/main.rs`
+(serves on `0.0.0.0:8080`), `tests/scenarios.rs` (runner), `scenarios/s01…s15.json`,
+`tests/perf.rs` (P3, brought forward from increment 6 since the allocator is pure).
+
+**Result**: 17 unit tests + 15 scenarios pass, `clippy` clean. The runner was checked against a
+deliberately wrong expectation (S03 expecting 151 kW): it reports
+`FAIL S03 …: step 2: setpoint of A: expected 151, got 150`. A `curl` smoke test against the real
+server confirmed the routes, the 409 error body, the `suspended_ev` status and the stdout log.
+
+```
+cargo test                                               # unit tests + scenarios
+cargo test --test scenarios -- --nocapture               # one line per scenario
+cargo test --release --test perf -- --ignored --nocapture
+```
+
+**P3 — allocator scaling** (release build, 2017 MacBook Pro, 1,000 runs each):
+
+| Sessions | p50 | p99 | max |
+|---|---|---|---|
+| 4 | 0.36 µs | 0.38 µs | 1.4 µs |
+| 100 | 2.7 µs | 5.1 µs | 36.4 µs |
+| 10,000 | 236 µs | 365 µs | 432 µs |
+
+Linear growth. Even a 10,000-session station uses under 0.05% of the 1 s budget for the
+computation: latency will be dominated by the network, as expected.
+
+**Implementation choices and deviations from the specs**
+
+- **Uniform JSON errors**: malformed bodies, missing fields and wrong types go through a custom
+  `JsonConfig` error handler (422); an invalid UUID in the URL is a 404 "unknown session". Both
+  are covered by a unit test in `api.rs`, since the scenario runner only sends well-formed requests.
+- **Log line simplified**: `session_started session=<id> setpoint=300kW station_allocated=300kW`
+  (no charger/connector, which is gone after a disconnect). Built under the lock, printed after.
+- **Runner checks `GET /status` after every step** (rather than the event response), so error
+  steps and observation-only steps are checked the same way.
+- **Scenario format details**: `config` is either inline or a path (`"config/station.json"`) to
+  avoid repeating the brief's station; a step without event only checks expectations; when
+  `http` is not expected, any 2xx is required (a typo in a scenario cannot pass silently); an
+  unknown alias maps to a random UUID to exercise "unknown session"; all scenarios run even if
+  one fails, and the report lists every failure.
+- **`status_since_ms` not checked by scenarios** (real clock), only status changes; exact values
+  are covered by the model's unit tests with a controlled clock.

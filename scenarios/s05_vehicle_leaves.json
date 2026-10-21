@@ -1,0 +1,11 @@
+{
+  "name": "S05 a vehicle leaves",
+  "why": "The brief's third case: when the first vehicle leaves, the second one takes all the power it wants again.",
+  "config": "config/station.json",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 }, "expect": { "setpoints": { "A": 200, "B": 200 } } },
+    { "disconnect": "A",
+      "expect": { "setpoints": { "B": 300 }, "statuses": { "A": "available", "B": "charging" }, "allocated_kw": 300 } }
+  ]
+}

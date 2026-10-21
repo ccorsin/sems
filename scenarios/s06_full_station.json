@@ -1,0 +1,13 @@
+{
+  "name": "S06 full station",
+  "why": "All four connectors busy: shares shrink step by step and no limit is exceeded at any level (400/3 does not divide evenly: rounding down keeps the total below the grid).",
+  "config": "config/station.json",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 }, "expect": { "setpoints": { "A": 300 } } },
+    { "connect": { "as": "B", "charger": "CP1", "connector": 2, "demand_kw": 300 }, "expect": { "setpoints": { "A": 150, "B": 150 } } },
+    { "connect": { "as": "C", "charger": "CP2", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 133.333, "B": 133.333, "C": 133.333 }, "allocated_kw": 399.999 } },
+    { "connect": { "as": "D", "charger": "CP2", "connector": 2, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 100, "B": 100, "C": 100, "D": 100 }, "allocated_kw": 400, "available_kw": 0 } }
+  ]
+}
