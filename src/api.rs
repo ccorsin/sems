@@ -5,10 +5,16 @@
 //! Every event response embeds the full station state: a convenience for demos and tests
 //! (a real charger should only see its own setpoints).
 //!
-//! Setpoints reach chargers through `/chargers/{id}/setpoints`: a plain GET returns them (pull),
-//! a WebSocket upgrade on the same URL streams every change (push). Each charger has a
-//! `watch` channel holding its latest setpoints: a slow client only ever gets the newest value,
-//! never a backlog of stale ones.
+//! Channels follow who speaks first. Whatever a charger initiates — session events and
+//! acknowledgements — is an HTTP request. Setpoints are initiated by the server (a charger must
+//! be told when *another* charger's event changes its share), and plain HTTP cannot speak
+//! first: they are pushed over a WebSocket, on `/chargers/{id}/setpoints` (a plain GET on the
+//! same URL returns them, as a pull fallback). Each charger has a `watch` channel holding its
+//! latest setpoints: a slow client only ever gets the newest value, never a backlog.
+//!
+//! Every pushed message carries a `version` (the `seq` of the event that last changed it). A
+//! charger acknowledges it with `POST /chargers/{id}/ack`; until then, increases are held
+//! station-wide ("decrease before increase", see `Station::grant`).
 //!
 //! Rule: no I/O under the station lock. Responses and log lines are built while holding it,
 //! then written after it is released. Publishing to the `watch` channels is in-memory and done
@@ -73,7 +79,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         .route("/sessions/{id}", web::delete().to(end_session))
         .route("/status", web::get().to(status))
         .route("/events", web::get().to(events))
-        .route("/chargers/{id}/setpoints", web::get().to(setpoints));
+        .route("/chargers/{id}/setpoints", web::get().to(setpoints))
+        .route("/chargers/{id}/ack", web::post().to(ack));
 }
 
 /// Current time in milliseconds since the Unix epoch.
@@ -105,6 +112,7 @@ async fn start_session(state: AppState, body: web::Json<StartSession>) -> HttpRe
     };
     run_event(&state, StatusCode::CREATED, "session_started", |st, now| {
         st.connect(&body.charger, body.connector, demand_w, now)
+            .map(Some)
     })
 }
 
@@ -120,7 +128,7 @@ async fn change_demand(
         return invalid_demand();
     };
     run_event(&state, StatusCode::OK, "demand_changed", |st, now| {
-        st.change_demand(id, demand_w, now).map(|()| id)
+        st.change_demand(id, demand_w, now).map(|()| Some(id))
     })
 }
 
@@ -129,7 +137,20 @@ async fn end_session(state: AppState, id: web::Path<String>) -> HttpResponse {
         return event_error(EventError::UnknownSession);
     };
     run_event(&state, StatusCode::OK, "session_ended", |st, now| {
-        st.disconnect(id, now).map(|()| id)
+        st.disconnect(id, now).map(|()| Some(id))
+    })
+}
+
+#[derive(Deserialize)]
+struct Ack {
+    version: u64,
+}
+
+/// A charger acknowledges the setpoints it received, up to `version`.
+async fn ack(state: AppState, id: web::Path<String>, body: web::Json<Ack>) -> HttpResponse {
+    let label = format!("ack charger={id} version={}", body.version);
+    run_event(&state, StatusCode::OK, &label, |st, now| {
+        st.ack(&id, body.version, now).map(|()| None)
     })
 }
 
@@ -151,7 +172,7 @@ async fn events(state: AppState, query: web::Query<EventsQuery>) -> HttpResponse
         st.history
             .iter()
             .rev()
-            .filter(|r| session.is_none_or(|id| r.session_id == id))
+            .filter(|r| session.is_none_or(|id| r.session.is_some_and(|(s, _, _)| s == id)))
             .take(limit)
             .map(|r| EventView::of(&st, r))
             .collect()
@@ -227,12 +248,12 @@ async fn push_setpoints(
 }
 
 /// Applies an event under the lock and publishes the chargers' new setpoints, then logs it
-/// and answers with the session's setpoint and the full station state.
+/// and answers with the session's setpoints (session events only) and the full station state.
 fn run_event(
     state: &AppState,
     code: StatusCode,
-    kind: &str,
-    event: impl FnOnce(&mut Station, u64) -> Result<Uuid, EventError>,
+    label: &str,
+    event: impl FnOnce(&mut Station, u64) -> Result<Option<Uuid>, EventError>,
 ) -> HttpResponse {
     let response = {
         let mut st = lock(state);
@@ -251,20 +272,39 @@ fn run_event(
                 changed
             });
         }
-        let setpoint_w = st
-            .sessions()
-            .find(|(_, _, s)| s.id == id)
-            .map_or(0, |(_, _, s)| s.setpoint_w);
+        // An ended session reports 0 kW.
+        let session = id.map(|id| {
+            let s = st
+                .sessions()
+                .find(|(_, _, s)| s.id == id)
+                .map(|(_, _, s)| s);
+            (
+                id,
+                s.map_or(0, |s| s.setpoint_w),
+                s.map_or(0, |s| s.target_w),
+            )
+        });
         EventResponse {
-            session_id: id,
-            setpoint_kw: kw(setpoint_w),
+            session_id: session.map(|s| s.0),
+            setpoint_kw: session.map(|s| kw(s.1)),
+            target_kw: session.map(|s| kw(s.2)),
             status: StatusView::of(&st),
         }
     };
     // Logs are for humans: 0.1 kW. The API keeps watt precision.
+    let session = match (response.session_id, response.setpoint_kw) {
+        (Some(id), Some(kw)) => format!(" session={id} setpoint={kw:.1}kW"),
+        _ => String::new(),
+    };
+    let pending: Vec<&str> = response
+        .status
+        .pending_acks
+        .iter()
+        .map(|p| p.charger.as_str())
+        .collect();
     println!(
-        "{kind} session={} setpoint={:.1}kW station_allocated={:.1}kW",
-        response.session_id, response.setpoint_kw, response.status.allocated_kw
+        "{label}{session} station_allocated={:.1}kW pending_acks={pending:?}",
+        response.status.allocated_kw
     );
     HttpResponse::build(code).json(response)
 }
@@ -294,6 +334,11 @@ fn event_error(e: EventError) -> HttpResponse {
         }
         EventError::ConnectorBusy => error(StatusCode::CONFLICT, "connector already has a session"),
         EventError::UnknownSession => error(StatusCode::NOT_FOUND, "unknown session"),
+        EventError::UnknownCharger => error(StatusCode::NOT_FOUND, "unknown charger"),
+        EventError::FutureVersion => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this version was never sent",
+        ),
     }
 }
 
@@ -306,15 +351,18 @@ fn kw(w: Watts) -> f64 {
 }
 
 /// History entry: the event, then the allocation that resulted from it.
+/// Session fields are `null` for an `ack`; `version` only appears for an `ack`.
 #[derive(Serialize)]
 struct EventView {
     seq: u64,
     at_ms: u64,
     kind: EventKind,
-    session_id: Uuid,
+    session_id: Option<Uuid>,
     charger: String,
-    connector: u32,
-    demand_kw: f64,
+    connector: Option<u32>,
+    demand_kw: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<u64>,
     result: ResultView,
 }
 
@@ -337,10 +385,11 @@ impl EventView {
             seq: r.seq,
             at_ms: r.at_ms,
             kind: r.kind,
-            session_id: r.session_id,
+            session_id: r.session.map(|(id, _, _)| id),
             charger: charger.id.clone(),
-            connector: charger.connectors[r.connector].id,
-            demand_kw: kw(r.demand_w),
+            connector: r.session.map(|(_, k, _)| charger.connectors[k].id),
+            demand_kw: r.session.map(|(_, _, w)| kw(w)),
+            version: r.version,
             result: ResultView {
                 allocated_kw: kw(r.setpoints.iter().map(|(_, w)| w).sum()),
                 setpoints: r
@@ -356,10 +405,12 @@ impl EventView {
     }
 }
 
-/// What a charger receives: the setpoint of each of its connectors (0 kW when free).
+/// What a charger receives: the setpoint of each of its connectors (0 kW when free), and the
+/// `version` to acknowledge.
 #[derive(Serialize, Clone, PartialEq)]
 struct ChargerSetpoints {
     charger: String,
+    version: u64,
     setpoints: Vec<ConnectorSetpoint>,
 }
 
@@ -385,15 +436,22 @@ impl ChargerSetpoints {
             .collect();
         ChargerSetpoints {
             charger: config.id.clone(),
+            version: st.links[charger].version,
             setpoints,
         }
     }
 }
 
+/// Answer to an event. Session fields are absent for an `ack`.
 #[derive(Serialize)]
 struct EventResponse {
-    session_id: Uuid,
-    setpoint_kw: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<Uuid>,
+    /// Granted, possibly below the target while an increase waits for acknowledgements.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setpoint_kw: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_kw: Option<f64>,
     status: StatusView,
 }
 
@@ -407,7 +465,16 @@ struct StatusView {
     available_kw: f64,
     /// Demand not served: Σ (demand − setpoint).
     unserved_kw: f64,
+    /// Chargers whose acknowledgement is awaited: while not empty, increases are held.
+    pending_acks: Vec<PendingAck>,
     chargers: Vec<ChargerView>,
+}
+
+#[derive(Serialize)]
+struct PendingAck {
+    charger: String,
+    /// The version to acknowledge; when it was sent is in `/events` (its `seq`).
+    version: u64,
 }
 
 #[derive(Serialize)]
@@ -416,6 +483,8 @@ struct ChargerView {
     max_kw: f64,
     allocated_kw: f64,
     unserved_kw: f64,
+    /// Version of its latest setpoints.
+    version: u64,
     connectors: Vec<ConnectorView>,
 }
 
@@ -435,7 +504,10 @@ struct SessionView {
     id: Uuid,
     started_at_ms: u64,
     demand_kw: f64,
+    /// Granted and published to the charger.
     setpoint_kw: f64,
+    /// What the allocator would give; above `setpoint_kw` while an increase is held.
+    target_kw: f64,
 }
 
 impl StatusView {
@@ -450,13 +522,15 @@ impl StatusView {
             .chargers
             .iter()
             .zip(&st.slots)
-            .map(|(charger, slots)| {
+            .zip(&st.links)
+            .map(|((charger, slots), link)| {
                 let sessions = || slots.iter().filter_map(|slot| slot.session.as_ref());
                 ChargerView {
                     id: charger.id.clone(),
                     max_kw: kw(charger.max_w),
                     allocated_kw: kw(sessions().map(|s| s.setpoint_w).sum()),
                     unserved_kw: kw(sessions().map(|s| s.demand_w - s.setpoint_w).sum()),
+                    version: link.version,
                     connectors: charger
                         .connectors
                         .iter()
@@ -472,6 +546,7 @@ impl StatusView {
                                 started_at_ms: s.started_at_ms,
                                 demand_kw: kw(s.demand_w),
                                 setpoint_kw: kw(s.setpoint_w),
+                                target_kw: kw(s.target_w),
                             }),
                         })
                         .collect(),
@@ -483,6 +558,13 @@ impl StatusView {
             allocated_kw: kw(allocated_w),
             available_kw: kw(st.config.grid_w - allocated_w),
             unserved_kw: kw(unserved_w),
+            pending_acks: st
+                .awaited()
+                .map(|c| PendingAck {
+                    charger: st.config.chargers[c].id.clone(),
+                    version: st.links[c].version,
+                })
+                .collect(),
             chargers,
         }
     }

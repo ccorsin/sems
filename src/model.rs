@@ -140,9 +140,23 @@ pub struct Session {
     pub id: Uuid,
     /// Power the vehicle currently accepts (input, may change at any time).
     pub demand_w: Watts,
-    /// Power the station allows (allocator output), always <= `demand_w`.
+    /// Power the allocator would give (the ideal split), always <= `demand_w`.
+    pub target_w: Watts,
+    /// Power granted and published to the charger. Equals `target_w` once the station is
+    /// settled; stays below it while an increase waits for other chargers' acknowledgements.
     pub setpoint_w: Watts,
     pub started_at_ms: u64,
+}
+
+/// Delivery state of a charger's setpoints ("decrease before increase").
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChargerLink {
+    /// `seq` of the event that last changed this charger's published setpoints; the charger
+    /// acknowledges it.
+    pub version: u64,
+    /// A decrease was published and not acknowledged yet: increases are held station-wide.
+    /// While awaited, a charger's setpoints can only go down, so `version` is the one awaited.
+    pub awaiting: bool,
 }
 
 /// Connector status, derived from its session (names borrowed from OCPP).
@@ -186,6 +200,9 @@ pub enum EventError {
     UnknownConnector,
     ConnectorBusy,
     UnknownSession,
+    UnknownCharger,
+    /// An acknowledgement for a version that was never sent.
+    FutureVersion,
 }
 
 /// Kind of an accepted event.
@@ -195,6 +212,8 @@ pub enum EventKind {
     SessionStarted,
     DemandChanged,
     SessionEnded,
+    /// A charger acknowledged its setpoints.
+    Ack,
 }
 
 /// History entry: an accepted event and the allocation that resulted from it.
@@ -202,17 +221,18 @@ pub enum EventKind {
 #[derive(Debug, Clone)]
 pub struct Record {
     /// Increases by one per accepted event and never restarts, even when old entries are
-    /// dropped: a reader can detect what it missed.
+    /// dropped: a reader can detect what it missed. Also the version of pushed setpoints.
     pub seq: u64,
     pub at_ms: u64,
     pub kind: EventKind,
-    pub session_id: Uuid,
-    /// Charger and connector indices, in config order.
+    /// Charger index, in config order.
     pub charger: usize,
-    pub connector: usize,
-    /// The session's demand after the event (its last demand for `SessionEnded`).
-    pub demand_w: Watts,
-    /// Setpoint of every active session right after the event.
+    /// Session events only: the session, its connector index, and its demand after the event
+    /// (its last demand for `SessionEnded`).
+    pub session: Option<(Uuid, usize, Watts)>,
+    /// `Ack` only: the version acknowledged.
+    pub version: Option<u64>,
+    /// Granted setpoint of every active session right after the event.
     pub setpoints: Vec<(Uuid, Watts)>,
 }
 
@@ -222,10 +242,9 @@ pub const HISTORY_CAP: usize = 10_000;
 /// What an accepted event is about; `apply` completes it into a [`Record`].
 struct Event {
     kind: EventKind,
-    session_id: Uuid,
     charger: usize,
-    connector: usize,
-    demand_w: Watts,
+    session: Option<(Uuid, usize, Watts)>,
+    version: Option<u64>,
 }
 
 /// The whole station: static config, live state of every connector, recent history.
@@ -234,6 +253,8 @@ pub struct Station {
     pub config: Config,
     /// `slots[c][k]` is connector `k` of charger `c`, in config order.
     pub slots: Vec<Vec<Slot>>,
+    /// Delivery state of each charger, in config order.
+    pub links: Vec<ChargerLink>,
     /// Latest accepted events, oldest first (at most `history_cap`).
     pub history: VecDeque<Record>,
     history_cap: usize,
@@ -257,6 +278,7 @@ impl Station {
             })
             .collect();
         Station {
+            links: vec![ChargerLink::default(); config.chargers.len()],
             config,
             slots,
             history: VecDeque::new(),
@@ -282,15 +304,15 @@ impl Station {
         let id = Uuid::new_v4();
         let event = Event {
             kind: EventKind::SessionStarted,
-            session_id: id,
             charger: c,
-            connector: k,
-            demand_w,
+            session: Some((id, k, demand_w)),
+            version: None,
         };
         self.apply(now_ms, event, |s| {
             s.slots[c][k].session = Some(Session {
                 id,
                 demand_w,
+                target_w: 0,
                 setpoint_w: 0,
                 started_at_ms: now_ms,
             });
@@ -308,10 +330,9 @@ impl Station {
         let (c, k) = self.find_session(id).ok_or(EventError::UnknownSession)?;
         let event = Event {
             kind: EventKind::DemandChanged,
-            session_id: id,
             charger: c,
-            connector: k,
-            demand_w,
+            session: Some((id, k, demand_w)),
+            version: None,
         };
         self.apply(now_ms, event, |s| {
             if let Some(session) = s.slots[c][k].session.as_mut() {
@@ -324,15 +345,47 @@ impl Station {
     /// The vehicle unplugs: its connector becomes available.
     pub fn disconnect(&mut self, id: Uuid, now_ms: u64) -> Result<(), EventError> {
         let (c, k) = self.find_session(id).ok_or(EventError::UnknownSession)?;
+        let demand_w = self.slots[c][k].session.as_ref().map_or(0, |s| s.demand_w);
         let event = Event {
             kind: EventKind::SessionEnded,
-            session_id: id,
             charger: c,
-            connector: k,
-            demand_w: self.slots[c][k].session.as_ref().map_or(0, |s| s.demand_w),
+            session: Some((id, k, demand_w)),
+            version: None,
         };
         self.apply(now_ms, event, |s| s.slots[c][k].session = None);
         Ok(())
+    }
+
+    /// A charger acknowledges having received (and, by assumption, applied) its setpoints up
+    /// to `version`. Acknowledging its latest version lifts its hold on increases; an older
+    /// one changes nothing (a newer decrease is still on its way).
+    pub fn ack(&mut self, charger: &str, version: u64, now_ms: u64) -> Result<(), EventError> {
+        let c = self
+            .config
+            .chargers
+            .iter()
+            .position(|x| x.id == charger)
+            .ok_or(EventError::UnknownCharger)?;
+        if version > self.last_seq {
+            return Err(EventError::FutureVersion);
+        }
+        let event = Event {
+            kind: EventKind::Ack,
+            charger: c,
+            session: None,
+            version: Some(version),
+        };
+        self.apply(now_ms, event, |s| {
+            if version >= s.links[c].version {
+                s.links[c].awaiting = false;
+            }
+        });
+        Ok(())
+    }
+
+    /// Chargers whose acknowledgement is awaited (indices, config order).
+    pub fn awaited(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.links.len()).filter(|&c| self.links[c].awaiting)
     }
 
     /// Active sessions with their `(charger, connector)` indices.
@@ -359,13 +412,15 @@ impl Station {
             .map(|(c, k, _)| (c, k))
     }
 
-    /// The single path of every accepted event: applies the mutation, recomputes every
-    /// setpoint, stamps connectors whose status changed, and records the event with the
-    /// resulting allocation. Rejected events never get here, so they are never recorded.
+    /// The single path of every accepted event: applies the mutation, recomputes the targets,
+    /// grants what is safe, stamps connectors whose status changed, and records the event with
+    /// the resulting allocation. Rejected events never get here, so they are never recorded.
     fn apply(&mut self, now_ms: u64, event: Event, mutate: impl FnOnce(&mut Self)) {
         let before: Vec<Status> = self.slots.iter().flatten().map(Slot::status).collect();
+        self.last_seq += 1;
         mutate(self);
         self.reallocate();
+        self.grant(self.last_seq);
         for (slot, old) in self.slots.iter_mut().flatten().zip(before) {
             if slot.status() != old {
                 slot.status_since_ms = now_ms;
@@ -375,7 +430,6 @@ impl Station {
         if self.history.len() == self.history_cap {
             self.history.pop_front();
         }
-        self.last_seq += 1;
         let setpoints = self
             .sessions()
             .map(|(_, _, s)| (s.id, s.setpoint_w))
@@ -384,14 +438,14 @@ impl Station {
             seq: self.last_seq,
             at_ms: now_ms,
             kind: event.kind,
-            session_id: event.session_id,
             charger: event.charger,
-            connector: event.connector,
-            demand_w: event.demand_w,
+            session: event.session,
+            version: event.version,
             setpoints,
         });
     }
 
+    /// Recomputes every session's target (the ideal split).
     fn reallocate(&mut self) {
         let demands: Vec<Demand> = self
             .sessions()
@@ -401,10 +455,50 @@ impl Station {
                 demand_w: s.demand_w,
             })
             .collect();
-        let setpoints = allocate(&self.config, &demands);
-        for (d, w) in demands.iter().zip(setpoints) {
+        let targets = allocate(&self.config, &demands);
+        for (d, w) in demands.iter().zip(targets) {
             if let Some(session) = self.slots[d.charger][d.connector].session.as_mut() {
-                session.setpoint_w = w;
+                session.target_w = w;
+            }
+        }
+    }
+
+    /// "Decrease before increase": decreases are granted at once and their charger must
+    /// acknowledge them; increases are granted only when no charger is awaited. Every
+    /// session then stays at or below a setpoint that was safe before the event, so the
+    /// grid and chargers are never exceeded, even while chargers apply their new setpoints.
+    fn grant(&mut self, seq: u64) {
+        let published = |s: &Self, c: usize| -> Vec<(Option<Uuid>, Watts)> {
+            let session = |slot: &Slot| slot.session.as_ref().map(|s| (s.id, s.setpoint_w));
+            s.slots[c]
+                .iter()
+                .map(|slot| session(slot).map_or((None, 0), |(id, w)| (Some(id), w)))
+                .collect()
+        };
+        let before: Vec<_> = (0..self.slots.len()).map(|c| published(self, c)).collect();
+
+        for (c, row) in self.slots.iter_mut().enumerate() {
+            for session in row.iter_mut().filter_map(|slot| slot.session.as_mut()) {
+                if session.target_w < session.setpoint_w {
+                    session.setpoint_w = session.target_w;
+                    self.links[c].awaiting = true;
+                }
+            }
+        }
+        if self.awaited().next().is_none() {
+            for session in self
+                .slots
+                .iter_mut()
+                .flatten()
+                .filter_map(|s| s.session.as_mut())
+            {
+                session.setpoint_w = session.target_w;
+            }
+        }
+
+        for (c, old) in before.into_iter().enumerate() {
+            if published(self, c) != old {
+                self.links[c].version = seq;
             }
         }
     }
@@ -428,6 +522,18 @@ mod tests {
     fn slot(st: &Station, id: Uuid) -> &Slot {
         let (c, k) = st.find_session(id).unwrap();
         &st.slots[c][k]
+    }
+
+    fn setpoint(st: &Station, id: Uuid) -> Watts {
+        slot(st, id).session.as_ref().unwrap().setpoint_w
+    }
+
+    /// Every awaited charger acknowledges its latest version, as instant chargers would.
+    fn settle(st: &mut Station, now_ms: u64) {
+        for c in st.awaited().collect::<Vec<_>>() {
+            let (id, version) = (st.config.chargers[c].id.clone(), st.links[c].version);
+            st.ack(&id, version, now_ms).unwrap();
+        }
     }
 
     #[test]
@@ -510,10 +616,11 @@ mod tests {
         assert_eq!(slot(&st, a).status_since_ms, 10);
         assert_eq!(slot(&st, a).session.as_ref().unwrap().started_at_ms, 10);
 
-        // B on the same charger: they share its 300 kW.
+        // B on the same charger: they share its 300 kW (once CP2 acknowledges A's decrease).
         let b = st.connect("CP2", 2, 300 * KW, 20).unwrap();
-        assert_eq!(slot(&st, a).session.as_ref().unwrap().setpoint_w, 150 * KW);
-        assert_eq!(slot(&st, b).session.as_ref().unwrap().setpoint_w, 150 * KW);
+        settle(&mut st, 21);
+        assert_eq!(setpoint(&st, a), 150 * KW);
+        assert_eq!(setpoint(&st, b), 150 * KW);
         assert_eq!(
             slot(&st, a).status_since_ms,
             10,
@@ -522,16 +629,20 @@ mod tests {
 
         // A's battery is full: A stays plugged in but takes no share, B gets everything.
         st.change_demand(a, 0, 30).unwrap();
+        settle(&mut st, 31);
         assert_eq!(slot(&st, a).status(), Status::SuspendedEv);
         assert_eq!(slot(&st, a).status_since_ms, 30);
-        assert_eq!(slot(&st, b).session.as_ref().unwrap().setpoint_w, 300 * KW);
+        assert_eq!(setpoint(&st, b), 300 * KW);
 
-        // A asks for power again (demand going up); B keeps what A does not take.
+        // A asks for power again: B must decrease first, so A waits at 0 kW (suspended_evse)
+        // until CP2 acknowledges, then charges; B keeps what A does not take.
         st.change_demand(a, 100 * KW, 40).unwrap();
+        assert_eq!(slot(&st, a).status(), Status::SuspendedEvse);
+        settle(&mut st, 41);
         assert_eq!(slot(&st, a).status(), Status::Charging);
-        assert_eq!(slot(&st, a).status_since_ms, 40);
-        assert_eq!(slot(&st, a).session.as_ref().unwrap().setpoint_w, 100 * KW);
-        assert_eq!(slot(&st, b).session.as_ref().unwrap().setpoint_w, 200 * KW);
+        assert_eq!(slot(&st, a).status_since_ms, 41);
+        assert_eq!(setpoint(&st, a), 100 * KW);
+        assert_eq!(setpoint(&st, b), 200 * KW);
 
         // B leaves: its connector is available again.
         st.disconnect(b, 50).unwrap();
@@ -567,6 +678,37 @@ mod tests {
             Err(EventError::UnknownSession),
             "already ended"
         );
+
+        assert_eq!(st.ack("CP9", 1, 0), Err(EventError::UnknownCharger));
+        assert_eq!(st.ack("CP1", 99, 0), Err(EventError::FutureVersion));
+    }
+
+    #[test]
+    fn decrease_before_increase() {
+        let mut st = station();
+        let a = st.connect("CP1", 1, 300 * KW, 0).unwrap();
+        assert_eq!(
+            st.awaited().count(),
+            0,
+            "an increase alone needs no acknowledgement"
+        );
+
+        // B arrives on CP2: A's decrease is published at once, B's increase is held.
+        let b = st.connect("CP2", 1, 300 * KW, 0).unwrap();
+        assert_eq!((setpoint(&st, a), setpoint(&st, b)), (200 * KW, 0));
+        assert_eq!(slot(&st, b).session.as_ref().unwrap().target_w, 200 * KW);
+        assert_eq!(st.awaited().collect::<Vec<_>>(), [0]);
+        let version = st.links[0].version;
+
+        // CP1 acknowledges: B's increase is granted.
+        st.ack("CP1", version, 0).unwrap();
+        assert_eq!((setpoint(&st, a), setpoint(&st, b)), (200 * KW, 200 * KW));
+        assert_eq!(st.awaited().count(), 0);
+
+        // A leaves: only increases follow, granted at once.
+        st.disconnect(a, 0).unwrap();
+        assert_eq!(setpoint(&st, b), 300 * KW);
+        assert_eq!(st.awaited().count(), 0);
     }
 
     #[test]
@@ -574,37 +716,44 @@ mod tests {
         let mut st = station();
         let a = st.connect("CP2", 1, 300 * KW, 10).unwrap();
         let b = st.connect("CP2", 2, 300 * KW, 20).unwrap();
-        st.change_demand(a, 100 * KW, 30).unwrap();
-        st.disconnect(b, 40).unwrap();
+        st.ack("CP2", 1, 25).unwrap(); // Stale: version 2 carries A's decrease.
+        st.ack("CP2", 2, 30).unwrap();
+        st.change_demand(a, 100 * KW, 40).unwrap();
+        st.disconnect(b, 50).unwrap();
         assert!(
-            st.connect("CP2", 1, KW, 50).is_err(),
+            st.connect("CP2", 1, KW, 60).is_err(),
             "rejected: not recorded"
         );
+        assert!(st.ack("CP2", 99, 60).is_err(), "rejected: not recorded");
 
         let h: Vec<&Record> = st.history.iter().collect();
-        assert_eq!(h.len(), 4);
-        assert_eq!(h.iter().map(|r| r.seq).collect::<Vec<_>>(), [1, 2, 3, 4]);
+        assert_eq!(
+            h.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6]
+        );
         assert_eq!(
             h.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
-            [10, 20, 30, 40]
+            [10, 20, 25, 30, 40, 50]
         );
 
-        // B's arrival: both sessions share CP2.
+        // B's arrival: A decreased at once, B held at 0 until CP2 acknowledges.
         assert_eq!(h[1].kind, EventKind::SessionStarted);
-        assert_eq!(h[1].setpoints, [(a, 150 * KW), (b, 150 * KW)]);
+        assert_eq!(h[1].setpoints, [(a, 150 * KW), (b, 0)]);
 
-        // A's demand drops: recorded with its new demand and the resulting split.
-        assert_eq!(h[2].kind, EventKind::DemandChanged);
-        assert_eq!((h[2].session_id, h[2].demand_w), (a, 100 * KW));
-        assert_eq!(h[2].setpoints, [(a, 100 * KW), (b, 200 * KW)]);
+        // The stale acknowledgement changes nothing; the right one releases B.
+        assert_eq!((h[2].kind, h[2].version), (EventKind::Ack, Some(1)));
+        assert_eq!(h[2].setpoints, [(a, 150 * KW), (b, 0)]);
+        assert_eq!(h[3].setpoints, [(a, 150 * KW), (b, 150 * KW)]);
+
+        // A's demand drops: recorded with its new demand (a decrease: granted at once).
+        assert_eq!(h[4].kind, EventKind::DemandChanged);
+        assert_eq!(h[4].session, Some((a, 0, 100 * KW)));
+        assert_eq!(h[4].setpoints[0], (a, 100 * KW));
 
         // B leaves: where it was and its last demand are kept; only A remains.
-        assert_eq!(h[3].kind, EventKind::SessionEnded);
-        assert_eq!(
-            (h[3].charger, h[3].connector, h[3].demand_w),
-            (1, 1, 300 * KW)
-        );
-        assert_eq!(h[3].setpoints, [(a, 100 * KW)]);
+        assert_eq!(h[5].kind, EventKind::SessionEnded);
+        assert_eq!((h[5].charger, h[5].session), (1, Some((b, 1, 300 * KW))));
+        assert_eq!(h[5].setpoints.len(), 1);
     }
 
     #[test]

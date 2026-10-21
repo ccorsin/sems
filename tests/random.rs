@@ -11,7 +11,9 @@
 
 mod common;
 use actix_web::{dev::ServiceResponse, test, App};
-use common::checks::{check_consistency, check_history, check_invariant, num, optimum_kw, EPS};
+use common::checks::{
+    check_consistency, check_history, check_invariant, check_transition, num, optimum_kw, EPS,
+};
 use sems::{api, model::Config, model::Station, model::MAX_KW};
 use serde_json::{json, Value};
 use std::env;
@@ -106,6 +108,8 @@ async fn run(seed: u64) -> Result<(), String> {
         .collect();
     let mut ended: Vec<String> = Vec::new();
     let mut last_seq = 0;
+    let get = |uri: &str| test::TestRequest::get().uri(uri).to_request();
+    let mut before: Value = test::call_and_read_body_json(&app, get("/status")).await;
 
     for step in 1..=STEPS {
         let active: Vec<String> = slots.iter().flatten().flatten().cloned().collect();
@@ -215,24 +219,55 @@ async fn run(seed: u64) -> Result<(), String> {
             }
         }
 
-        let status: Value = test::call_and_read_body_json(
-            &app,
-            test::TestRequest::get().uri("/status").to_request(),
-        )
-        .await;
-        let latest: Vec<Value> = test::call_and_read_body_json(
-            &app,
-            test::TestRequest::get().uri("/events?limit=1").to_request(),
-        )
-        .await;
-        check_invariant(&status).map_err(at)?;
-        check_consistency(&status).map_err(at)?;
-        check_history(&mut last_seq, accepted, &latest, &status).map_err(at)?;
-        check_shadow(&status, &slots).map_err(at)?;
+        // Perfect chargers: every awaited one acknowledges at once. Each request (the event,
+        // then each acknowledgement) is followed by the full set of checks.
+        let mut accepted = accepted;
+        let mut acks: Vec<(String, u64)> = Vec::new();
+        for _ in 0..100 {
+            let status: Value = test::call_and_read_body_json(&app, get("/status")).await;
+            let latest: Vec<Value> =
+                test::call_and_read_body_json(&app, get("/events?limit=1")).await;
+            check_invariant(&status).map_err(at)?;
+            check_consistency(&status).map_err(at)?;
+            check_transition(&before, &status).map_err(at)?;
+            check_history(&mut last_seq, accepted.take(), &latest, &status).map_err(at)?;
+            check_shadow(&status, &slots).map_err(at)?;
+            before = status;
+            if acks.is_empty() {
+                acks = before["pending_acks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| {
+                        (
+                            p["charger"].as_str().unwrap().to_string(),
+                            p["version"].as_u64().unwrap(),
+                        )
+                    })
+                    .collect();
+            }
+            let Some((charger, version)) = acks.pop() else {
+                break;
+            };
+            let request = test::TestRequest::post()
+                .uri(&format!("/chargers/{charger}/ack"))
+                .set_json(json!({ "version": version }));
+            let res = test::call_service(&app, request.to_request()).await;
+            if res.status() != 200 {
+                return Err(at(format!(
+                    "ack {charger} v{version}: HTTP {}",
+                    res.status()
+                )));
+            }
+            accepted = Some(("ack", Value::Null));
+        }
+        if !before["pending_acks"].as_array().unwrap().is_empty() {
+            return Err(at("acknowledgements never settle the station".into()));
+        }
 
-        // No waste beyond rounding: at most 1 W per session stays unallocated.
+        // No waste beyond rounding, once settled: at most 1 W per session stays unallocated.
         let sessions = slots.iter().flatten().flatten().count() as f64;
-        let waste = optimum_kw(&status) - num(&status["allocated_kw"]);
+        let waste = optimum_kw(&before) - num(&before["allocated_kw"]);
         if waste > sessions * 0.001 + EPS {
             return Err(at(format!(
                 "waste: {waste} kW left unused with {sessions} sessions"

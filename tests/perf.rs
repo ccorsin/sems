@@ -7,7 +7,7 @@
 //! measures that serialization.
 
 mod common;
-use common::{brief, change_demand, connect, get, kw, next, next_within, start, subscribe};
+use common::{brief, change_demand, connect, get, kw, next, next_within, settle, start, subscribe};
 use futures_util::future::join_all;
 use sems::allocator::{allocate, Demand};
 use sems::model::{Charger, Config, Connector};
@@ -38,21 +38,23 @@ async fn p1_event_to_push_latency() {
     let b = connect(&addr, "CP2", 1, 300.0).await;
     assert_eq!(kw(&next(&mut cp1).await.unwrap(), 1), 200.0);
 
-    // B alternates between 0 kW (takes no share: A gets 300) and 300 kW (A back to 200).
+    // Untimed: B drops to 0 kW and the chargers settle, so A is back to 300 kW. Timed: B asks
+    // for 300 kW again and A's decrease to 200 kW reaches CP1. A decrease is published at once;
+    // an increase waits for acknowledgements (decrease before increase), hence this direction.
     let client = awc::Client::new();
     let mut times = Vec::with_capacity(RUNS);
-    for i in 0..RUNS {
-        let (demand, expected) = if i % 2 == 0 {
-            (0.0, 300.0)
-        } else {
-            (300.0, 200.0)
-        };
+    for _ in 0..RUNS {
+        settle(&addr).await;
+        change_demand(&client, &addr, &b, 0.0).await;
+        settle(&addr).await;
+        assert_eq!(kw(&next(&mut cp1).await.unwrap(), 1), 300.0);
+
         let start = Instant::now();
-        let (code, _) = change_demand(&client, &addr, &b, demand).await;
+        let (code, _) = change_demand(&client, &addr, &b, 300.0).await;
         let pushed = next_within(&mut cp1, Duration::from_secs(1)).await;
         times.push(start.elapsed());
         assert_eq!(code, 200);
-        assert_eq!(kw(&pushed.expect("push within 1 s"), 1), expected);
+        assert_eq!(kw(&pushed.expect("push within 1 s"), 1), 200.0);
     }
 
     println!("\nP1 event → push to another charger ({RUNS} runs)");

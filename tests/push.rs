@@ -1,10 +1,10 @@
 //! Setpoint delivery to chargers (`/chargers/{id}/setpoints`), against a real server on a
-//! random local port: WebSocket push, plain GET pull, unknown charger.
+//! random local port: WebSocket push, plain GET pull, acknowledgements, unknown charger.
 //! Station: the brief's, grid 400 kW, CP1 and CP2 of 300 kW.
 //! Clients use `awc`, actix's own HTTP and WebSocket client.
 
 mod common;
-use common::{brief, connect, get, kw, next, start, subscribe};
+use common::{ack, brief, connect, get, kw, next, start, subscribe};
 
 #[actix_web::test]
 async fn other_charger_is_told_without_asking() {
@@ -19,9 +19,14 @@ async fn other_charger_is_told_without_asking() {
     connect(&addr, "CP1", 1, 300.0).await;
     assert_eq!(kw(&next(&mut cp1).await.unwrap(), 1), 300.0);
 
-    // B plugs into CP2: CP1 must lower A to 200 kW although it sent nothing.
+    // B plugs into CP2: CP1 must lower A to 200 kW although it sent nothing. B is held at
+    // 0 kW until CP1 acknowledges (decrease before increase), then gets its 200 kW.
     connect(&addr, "CP2", 1, 300.0).await;
-    assert_eq!(kw(&next(&mut cp1).await.unwrap(), 1), 200.0);
+    let decrease = next(&mut cp1).await.unwrap();
+    assert_eq!(kw(&decrease, 1), 200.0);
+    assert_eq!(kw(&next(&mut cp2).await.unwrap(), 1), 0.0);
+    assert_eq!(next(&mut cp2).await, None, "held until CP1 acknowledges");
+    ack(&awc::Client::new(), &addr, &decrease).await;
     assert_eq!(kw(&next(&mut cp2).await.unwrap(), 1), 200.0);
 
     // Pull fallback: a plain GET on the same URL returns what was last pushed.

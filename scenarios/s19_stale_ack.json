@@ -1,0 +1,17 @@
+{
+  "name": "S19 stale acknowledgement",
+  "why": "Two decreases sent to CP1 in a row (B, then C arrive): acknowledging the first version proves nothing about the second, so increases stay held until CP1 acknowledges its latest version.",
+  "config": "config/station.json",
+  "acks": "manual",
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 200, "B": 0 }, "pending": ["CP1"] } },
+    { "connect": { "as": "C", "charger": "CP2", "connector": 2, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 133.333, "B": 0, "C": 0 }, "targets": { "B": 133.333, "C": 133.333 },
+                  "pending": ["CP1"] } },
+    { "ack": { "charger": "CP1", "version": 2 },
+      "expect": { "setpoints": { "A": 133.333, "B": 0, "C": 0 }, "pending": ["CP1"] } },
+    { "ack": "CP1", "expect": { "setpoints": { "A": 133.333, "B": 133.333, "C": 133.333 }, "pending": [] } }
+  ]
+}
