@@ -5,9 +5,14 @@
 //! A seeded generator makes every run reproducible: a failure prints its seed, replayed with
 //! `SEMS_SEED=<seed> cargo test --test random`. 50 stations by default (a few seconds);
 //! `SEMS_RUNS=1000 cargo test --test random` plays more. A shadow model (which session is on which
-//! connector) predicts the HTTP code of every event. Checked after each step:
-//! expected code (never a 5xx), safety, history, `/status` consistency, shadow agreement, and
-//! no waste beyond rounding (< 1 W per session).
+//! connector) predicts the HTTP code of every request.
+//!
+//! Acknowledgements are random steps too: late, twice, stale, for a future version, for an
+//! unknown charger, or never. Checked after each step: expected code (never a 5xx), safety,
+//! transition, history, `/status` consistency, shadow agreement, and no waste beyond rounding
+//! (< 1 W per session) whenever the station is settled. Each run ends with every charger
+//! acknowledging, which must settle the station with no waste. A stale acknowledgement must not
+//! release increases: that rule is the server's version comparison, tested by scenario S19.
 
 mod common;
 use actix_web::{dev::ServiceResponse, test, App};
@@ -127,7 +132,7 @@ async fn run(seed: u64) -> Result<(), String> {
 
         // The request, what the shadow model expects, and the history kind if accepted.
         let (description, request, expected, kind, target) = match rng.below(100) {
-            0..40 => {
+            0..30 => {
                 let demand = rng.demand_kw();
                 let c = rng.below(slots.len() as u64) as usize;
                 let k = rng.below(slots[c].len() as u64) as usize;
@@ -157,7 +162,7 @@ async fn run(seed: u64) -> Result<(), String> {
                     Some((c, k)),
                 )
             }
-            40..75 => {
+            30..55 => {
                 let (id, known) = pick_session(&mut rng);
                 let demand = rng.demand_kw();
                 let expected = match ((0.0..=MAX_KW).contains(&demand), known) {
@@ -176,7 +181,7 @@ async fn run(seed: u64) -> Result<(), String> {
                     None,
                 )
             }
-            _ => {
+            55..70 => {
                 let (id, known) = pick_session(&mut rng);
                 let request = test::TestRequest::delete().uri(&format!("/sessions/{id}"));
                 let expected = if known { 200 } else { 404 };
@@ -185,6 +190,41 @@ async fn run(seed: u64) -> Result<(), String> {
                     request,
                     expected,
                     "session_ended",
+                    None,
+                )
+            }
+            // Acknowledgements arrive late, in any order, twice, stale, or never: mostly the
+            // charger's latest version, sometimes an older one, a future one, or an unknown
+            // charger.
+            _ => {
+                let c = rng.below(slots.len() as u64) as usize;
+                let unknown = rng.chance(5);
+                let charger = if unknown {
+                    "CPX".to_string()
+                } else {
+                    format!("CP{}", c + 1)
+                };
+                let latest = before["chargers"][c]["version"].as_u64().unwrap();
+                let version = match rng.below(100) {
+                    0..70 => latest,
+                    70..90 => rng.below(latest + 1),
+                    _ => last_seq + 1 + rng.below(5),
+                };
+                let expected = if unknown {
+                    404
+                } else if version > last_seq {
+                    422
+                } else {
+                    200
+                };
+                let request = test::TestRequest::post()
+                    .uri(&format!("/chargers/{charger}/ack"))
+                    .set_json(json!({ "version": version }));
+                (
+                    format!("ack {charger} v{version}"),
+                    request,
+                    expected,
+                    "ack",
                     None,
                 )
             }
@@ -200,8 +240,8 @@ async fn run(seed: u64) -> Result<(), String> {
 
         // Keep the shadow model in step with accepted events.
         let accepted = (code < 300).then(|| (kind, body["session_id"].clone()));
-        if let Some((_, id)) = &accepted {
-            let id = id.as_str().unwrap().to_string();
+        if let Some((_, Value::String(id))) = &accepted {
+            let id = id.clone();
             match kind {
                 "session_started" => {
                     let (c, k) = target.unwrap();
@@ -219,62 +259,58 @@ async fn run(seed: u64) -> Result<(), String> {
             }
         }
 
-        // Perfect chargers: every awaited one acknowledges at once. Each request (the event,
-        // then each acknowledgement) is followed by the full set of checks.
-        let mut accepted = accepted;
-        let mut acks: Vec<(String, u64)> = Vec::new();
-        for _ in 0..100 {
-            let status: Value = test::call_and_read_body_json(&app, get("/status")).await;
-            let latest: Vec<Value> =
-                test::call_and_read_body_json(&app, get("/events?limit=1")).await;
-            check_invariant(&status).map_err(at)?;
-            check_consistency(&status).map_err(at)?;
-            check_transition(&before, &status).map_err(at)?;
-            check_history(&mut last_seq, accepted.take(), &latest, &status).map_err(at)?;
-            check_shadow(&status, &slots).map_err(at)?;
-            before = status;
-            if acks.is_empty() {
-                acks = before["pending_acks"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|p| {
-                        (
-                            p["charger"].as_str().unwrap().to_string(),
-                            p["version"].as_u64().unwrap(),
-                        )
-                    })
-                    .collect();
-            }
-            let Some((charger, version)) = acks.pop() else {
-                break;
-            };
-            let request = test::TestRequest::post()
-                .uri(&format!("/chargers/{charger}/ack"))
-                .set_json(json!({ "version": version }));
-            let res = test::call_service(&app, request.to_request()).await;
-            if res.status() != 200 {
-                return Err(at(format!(
-                    "ack {charger} v{version}: HTTP {}",
-                    res.status()
-                )));
-            }
-            accepted = Some(("ack", Value::Null));
+        let status: Value = test::call_and_read_body_json(&app, get("/status")).await;
+        let latest: Vec<Value> = test::call_and_read_body_json(&app, get("/events?limit=1")).await;
+        check_invariant(&status).map_err(at)?;
+        check_consistency(&status).map_err(at)?;
+        check_transition(&before, &status).map_err(at)?;
+        check_history(&mut last_seq, accepted, &latest, &status).map_err(at)?;
+        check_shadow(&status, &slots).map_err(at)?;
+        if status["pending_acks"].as_array().unwrap().is_empty() {
+            check_waste(&status, &slots).map_err(at)?;
         }
-        if !before["pending_acks"].as_array().unwrap().is_empty() {
-            return Err(at("acknowledgements never settle the station".into()));
-        }
-
-        // No waste beyond rounding, once settled: at most 1 W per session stays unallocated.
-        let sessions = slots.iter().flatten().flatten().count() as f64;
-        let waste = optimum_kw(&before) - num(&before["allocated_kw"]);
-        if waste > sessions * 0.001 + EPS {
-            return Err(at(format!(
-                "waste: {waste} kW left unused with {sessions} sessions"
-            )));
-        }
+        before = status;
     }
+
+    // In the end, every charger acknowledges: the station must settle with no waste.
+    let at = |e: String| format!("final settling: {e}\nconfig: {config}");
+    for pending in before["pending_acks"].as_array().unwrap().clone() {
+        let request = test::TestRequest::post()
+            .uri(&format!(
+                "/chargers/{}/ack",
+                pending["charger"].as_str().unwrap()
+            ))
+            .set_json(json!({ "version": pending["version"] }));
+        let res = test::call_service(&app, request.to_request()).await;
+        if res.status() != 200 {
+            return Err(at(format!("ack {pending}: HTTP {}", res.status())));
+        }
+        let status: Value = test::call_and_read_body_json(&app, get("/status")).await;
+        let latest: Vec<Value> = test::call_and_read_body_json(&app, get("/events?limit=1")).await;
+        check_invariant(&status).map_err(at)?;
+        check_transition(&before, &status).map_err(at)?;
+        check_history(&mut last_seq, Some(("ack", Value::Null)), &latest, &status).map_err(at)?;
+        before = status;
+    }
+    if !before["pending_acks"].as_array().unwrap().is_empty() {
+        return Err(at(
+            "acknowledging every pending version does not settle the station".into(),
+        ));
+    }
+    check_waste(&before, &slots).map_err(at)?;
     Ok(())
+}
+
+/// No waste beyond rounding on a settled station: at most 1 W per session stays unallocated.
+fn check_waste(status: &Value, slots: &[Vec<Option<String>>]) -> Result<(), String> {
+    let sessions = slots.iter().flatten().flatten().count() as f64;
+    let waste = optimum_kw(status) - num(&status["allocated_kw"]);
+    match waste > sessions * 0.001 + EPS {
+        true => Err(format!(
+            "waste: {waste} kW left unused with {sessions} sessions"
+        )),
+        false => Ok(()),
+    }
 }
 
 /// The server's sessions are exactly the ones the shadow model expects, on the same connectors.
