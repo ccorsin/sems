@@ -40,7 +40,8 @@ pub fn fill(capacity: Watts, mut caps: Vec<Watts>) -> Watts {
 }
 
 /// Computes one setpoint per demand, in the same order.
-pub fn allocate(config: &Config, demands: &[Demand]) -> Vec<Watts> {
+/// `capacity_w` is the power offered to vehicles: the grid, plus the BESS boost if any.
+pub fn allocate(config: &Config, capacity_w: Watts, demands: &[Demand]) -> Vec<Watts> {
     // 1. Each session's own cap: what the vehicle accepts, within its connector.
     //    A zero demand is a zero cap: it naturally takes nothing.
     let caps: Vec<Watts> = demands
@@ -70,18 +71,24 @@ pub fn allocate(config: &Config, demands: &[Demand]) -> Vec<Watts> {
         .collect();
 
     // 4–5. Grid level: every session shares the grid, each within its lowered cap.
-    let grid_level = fill(config.grid_w, caps.clone());
+    let grid_level = fill(capacity_w, caps.clone());
     let setpoints: Vec<Watts> = caps.into_iter().map(|cap| cap.min(grid_level)).collect();
 
     debug_assert!(
-        within_limits(config, demands, &setpoints),
+        within_limits(config, capacity_w, demands, &setpoints),
         "allocation exceeds a limit"
     );
     setpoints
 }
 
-/// Safety invariant: no setpoint above its demand or connector, no charger or grid overload.
-pub fn within_limits(config: &Config, demands: &[Demand], setpoints: &[Watts]) -> bool {
+/// Safety invariant: no setpoint above its demand or connector, no charger overload, and the
+/// vehicles' total within `capacity_w` (the grid plus the BESS boost).
+pub fn within_limits(
+    config: &Config,
+    capacity_w: Watts,
+    demands: &[Demand],
+    setpoints: &[Watts],
+) -> bool {
     let mut per_charger = vec![0; config.chargers.len()];
     for (d, &w) in demands.iter().zip(setpoints) {
         if w > d.demand_w || w > config.chargers[d.charger].connectors[d.connector].max_w {
@@ -93,7 +100,7 @@ pub fn within_limits(config: &Config, demands: &[Demand], setpoints: &[Watts]) -
         .iter()
         .zip(&config.chargers)
         .all(|(&w, c)| w <= c.max_w)
-        && per_charger.iter().sum::<Watts>() <= config.grid_w
+        && per_charger.iter().sum::<Watts>() <= capacity_w
 }
 
 #[cfg(test)]
@@ -123,6 +130,7 @@ mod tests {
         Config {
             grid_w: grid_kw * KW,
             chargers,
+            bess: None,
         }
     }
 
@@ -141,13 +149,17 @@ mod tests {
 
     #[test]
     fn empty_station() {
-        assert!(allocate(&config(400, &[300, 300]), &[]).is_empty());
+        assert!(allocate(&config(400, &[300, 300]), 400 * KW, &[]).is_empty());
     }
 
     #[test]
     fn single_vehicle_capped_by_its_charger() {
         assert_eq!(
-            kw(allocate(&config(400, &[300, 300]), &[d(0, 0, 350)])),
+            kw(allocate(
+                &config(400, &[300, 300]),
+                400 * KW,
+                &[d(0, 0, 350)]
+            )),
             [300]
         );
     }
@@ -155,7 +167,11 @@ mod tests {
     #[test]
     fn single_vehicle_gets_its_demand() {
         assert_eq!(
-            kw(allocate(&config(400, &[300, 300]), &[d(0, 0, 120)])),
+            kw(allocate(
+                &config(400, &[300, 300]),
+                400 * KW,
+                &[d(0, 0, 120)]
+            )),
             [120]
         );
     }
@@ -164,7 +180,7 @@ mod tests {
     fn local_contention_same_charger() {
         let cfg = config(400, &[300, 300]);
         assert_eq!(
-            kw(allocate(&cfg, &[d(0, 0, 300), d(0, 1, 300)])),
+            kw(allocate(&cfg, cfg.grid_w, &[d(0, 0, 300), d(0, 1, 300)])),
             [150, 150]
         );
     }
@@ -173,7 +189,7 @@ mod tests {
     fn global_contention_different_chargers() {
         let cfg = config(400, &[300, 300]);
         assert_eq!(
-            kw(allocate(&cfg, &[d(0, 0, 300), d(1, 0, 300)])),
+            kw(allocate(&cfg, cfg.grid_w, &[d(0, 0, 300), d(1, 0, 300)])),
             [200, 200]
         );
     }
@@ -182,20 +198,23 @@ mod tests {
     fn full_station() {
         let cfg = config(400, &[300, 300]);
         let all = [d(0, 0, 300), d(0, 1, 300), d(1, 0, 300), d(1, 1, 300)];
-        assert_eq!(kw(allocate(&cfg, &all)), [100, 100, 100, 100]);
+        assert_eq!(kw(allocate(&cfg, cfg.grid_w, &all)), [100, 100, 100, 100]);
     }
 
     #[test]
     fn capped_by_connector() {
         let mut cfg = config(400, &[300, 300]);
         cfg.chargers[0].connectors[0].max_w = 150 * KW;
-        assert_eq!(kw(allocate(&cfg, &[d(0, 0, 300)])), [150]);
+        assert_eq!(kw(allocate(&cfg, cfg.grid_w, &[d(0, 0, 300)])), [150]);
     }
 
     #[test]
     fn zero_demand_takes_no_share() {
         let cfg = config(400, &[300, 300]);
-        assert_eq!(kw(allocate(&cfg, &[d(0, 0, 0), d(0, 1, 300)])), [0, 300]);
+        assert_eq!(
+            kw(allocate(&cfg, cfg.grid_w, &[d(0, 0, 0), d(0, 1, 300)])),
+            [0, 300]
+        );
     }
 
     #[test]
@@ -203,9 +222,9 @@ mod tests {
         // 400 kW / 3 sessions does not divide evenly: each gets 133 333 W, 1 W stays unallocated.
         let cfg = config(400, &[300, 300]);
         let demands = [d(0, 0, 300), d(0, 1, 300), d(1, 0, 300)];
-        let setpoints = allocate(&cfg, &demands);
+        let setpoints = allocate(&cfg, cfg.grid_w, &demands);
         assert_eq!(setpoints, [133_333, 133_333, 133_333]);
-        assert!(within_limits(&cfg, &demands, &setpoints));
+        assert!(within_limits(&cfg, cfg.grid_w, &demands, &setpoints));
     }
 
     #[test]
@@ -226,7 +245,11 @@ mod tests {
         // V1 gave 150 / 150 / 166.7 kW (33.3 kW wasted). CP1 cannot give A and B more than
         // 150 kW each, so C takes the 200 kW left of the grid.
         let cfg = config(500, &[300, 300]);
-        let setpoints = allocate(&cfg, &[d(0, 0, 300), d(0, 1, 300), d(1, 0, 300)]);
+        let setpoints = allocate(
+            &cfg,
+            cfg.grid_w,
+            &[d(0, 0, 300), d(0, 1, 300), d(1, 0, 300)],
+        );
         assert_eq!(kw(setpoints), [150, 150, 200]);
     }
 
@@ -235,7 +258,7 @@ mod tests {
         // V1 gave 133.3 / 22 / 50 kW. The 22 and 50 kW chargers are served in full and the
         // 300 kW one takes everything it can.
         let cfg = config(400, &[300, 22, 50]);
-        let setpoints = allocate(&cfg, &[d(0, 0, 300), d(1, 0, 22), d(2, 0, 50)]);
+        let setpoints = allocate(&cfg, cfg.grid_w, &[d(0, 0, 300), d(1, 0, 22), d(2, 0, 50)]);
         assert_eq!(kw(setpoints), [300, 22, 50]);
     }
 
@@ -243,15 +266,26 @@ mod tests {
     fn demand_drop_is_redistributed() {
         // V1 gave 50 / 200 kW: B now gets what A no longer takes, up to its charger.
         let cfg = config(400, &[300, 300]);
-        assert_eq!(kw(allocate(&cfg, &[d(0, 0, 50), d(1, 0, 300)])), [50, 300]);
+        assert_eq!(
+            kw(allocate(&cfg, cfg.grid_w, &[d(0, 0, 50), d(1, 0, 300)])),
+            [50, 300]
+        );
     }
 
     #[test]
     fn smallest_demand_served_first() {
         // Grid 100 kW, three chargers: 10 kW is served in full, the others share 90 kW.
         let cfg = config(100, &[300, 300, 300]);
-        let setpoints = allocate(&cfg, &[d(0, 0, 80), d(1, 0, 10), d(2, 0, 80)]);
+        let setpoints = allocate(&cfg, cfg.grid_w, &[d(0, 0, 80), d(1, 0, 10), d(2, 0, 80)]);
         assert_eq!(kw(setpoints), [45, 10, 45]);
+    }
+
+    #[test]
+    fn capacity_above_the_grid_is_shared_too() {
+        // A 200 kW BESS boost on a 400 kW grid: two vehicles get their full 300 kW.
+        let cfg = config(400, &[300, 300]);
+        let setpoints = allocate(&cfg, 600 * KW, &[d(0, 0, 300), d(1, 0, 300)]);
+        assert_eq!(kw(setpoints), [300, 300]);
     }
 
     #[test]
@@ -259,15 +293,20 @@ mod tests {
         let cfg = config(400, &[300, 300]);
         let demands = [d(0, 0, 300), d(1, 0, 300)];
         assert!(
-            !within_limits(&cfg, &demands, &[300 * KW, 300 * KW]),
+            !within_limits(&cfg, cfg.grid_w, &demands, &[300 * KW, 300 * KW]),
             "grid overload"
         );
         assert!(
-            !within_limits(&cfg, &[d(0, 0, 300), d(0, 1, 300)], &[200 * KW, 200 * KW]),
+            !within_limits(
+                &cfg,
+                cfg.grid_w,
+                &[d(0, 0, 300), d(0, 1, 300)],
+                &[200 * KW, 200 * KW]
+            ),
             "charger overload"
         );
         assert!(
-            !within_limits(&cfg, &[d(0, 0, 100)], &[150 * KW]),
+            !within_limits(&cfg, cfg.grid_w, &[d(0, 0, 100)], &[150 * KW]),
             "above demand"
         );
     }

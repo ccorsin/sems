@@ -11,6 +11,13 @@ pub fn num(v: &Value) -> f64 {
     v.as_f64().unwrap_or(f64::NAN)
 }
 
+/// Power offered to vehicles: the grid plus the BESS boost (the grid alone before V4).
+pub fn capacity(status: &Value) -> f64 {
+    status["capacity_kw"]
+        .as_f64()
+        .unwrap_or_else(|| num(&status["grid_kw"]))
+}
+
 /// Safety invariant: no setpoint above its demand or connector, no charger or grid overload.
 pub fn check_invariant(status: &Value) -> Result<(), String> {
     let mut station_total = 0.0;
@@ -37,8 +44,15 @@ pub fn check_invariant(status: &Value) -> Result<(), String> {
         }
         station_total += charger_total;
     }
-    if station_total > num(&status["grid_kw"]) + EPS {
-        return Err(format!("invariant: grid overloaded ({station_total} kW)"));
+    if station_total > capacity(status) + EPS {
+        return Err(format!("invariant: capacity exceeded ({station_total} kW)"));
+    }
+    // Whatever the BESS does, the grid connection sees neither an overload nor an export.
+    let (import, grid) = (num(&status["grid_import_kw"]), num(&status["grid_kw"]));
+    if !(-EPS..=grid + EPS).contains(&import) {
+        return Err(format!(
+            "invariant: grid import {import} kW outside 0..={grid}"
+        ));
     }
     Ok(())
 }
@@ -136,12 +150,60 @@ pub fn check_consistency(status: &Value) -> Result<(), String> {
     }
     close("allocated_kw", num(&status["allocated_kw"]), allocated)?;
     close("unserved_kw", num(&status["unserved_kw"]), unserved)?;
-    let grid = num(&status["grid_kw"]);
     close(
         "available_kw",
         num(&status["available_kw"]),
-        grid - allocated,
-    )
+        (capacity(status) - allocated).max(0.0),
+    )?;
+    check_bess(status, allocated)
+}
+
+/// The BESS runs one flow at a time, following the rule: discharge what vehicles draw beyond
+/// the grid; else charge with the headroom (up to its maximum) while not full; else idle.
+/// The grid import follows from it.
+fn check_bess(status: &Value, allocated: f64) -> Result<(), String> {
+    let bess = &status["bess"];
+    let grid = num(&status["grid_kw"]);
+    let (mode, power) = match bess.is_null() {
+        true => ("idle", 0.0),
+        false => (bess["mode"].as_str().unwrap(), num(&bess["power_kw"])),
+    };
+    let expected = if allocated > grid + EPS {
+        ("discharging", allocated - grid)
+    } else {
+        let headroom = (grid - allocated).min(num(&bess["max_kw"]));
+        let soc = bess["soc"].as_f64();
+        match soc.is_some_and(|soc| soc < 1.0) && headroom > EPS {
+            true => ("charging", headroom),
+            false => ("idle", 0.0),
+        }
+    };
+    let expected = if bess.is_null() {
+        ("idle", 0.0)
+    } else {
+        expected
+    };
+    if mode != expected.0 || (power - expected.1).abs() > EPS {
+        return Err(format!(
+            "bess: {mode} {power} kW, expected {} {} kW",
+            expected.0, expected.1
+        ));
+    }
+    if !bess.is_null() && power > num(&bess["max_kw"]) + EPS {
+        return Err(format!("bess: {power} kW above its maximum"));
+    }
+    let import = match mode {
+        "discharging" => allocated - power,
+        "charging" => allocated + power,
+        _ => allocated,
+    };
+    let got = num(&status["grid_import_kw"]);
+    match (got - import).abs() <= EPS {
+        true => Ok(()),
+        false => Err(format!(
+            "consistency: grid_import_kw is {got}, expected {import}"
+        )),
+    }
 }
 
 /// The most power deliverable within every limit (kW):
@@ -161,7 +223,7 @@ pub fn optimum_kw(status: &Value) -> f64 {
             sessions.min(num(&charger["max_kw"]))
         })
         .fold(0.0, |a, b| a + b); // Not `sum()`: an empty f64 sum is -0.0, printed "-0.0".
-    deliverable.min(num(&status["grid_kw"]))
+    deliverable.min(capacity(status))
 }
 
 /// Setpoint (kW) of every connector, keyed `"charger/connector"` (0 when free).
@@ -216,7 +278,9 @@ pub fn check_transition(before: &Value, after: &Value) -> Result<f64, String> {
         }
         station += total;
     }
-    let excess = station - num(&after["grid_kw"]);
+    // While vehicles apply a lower capacity (the BESS boost just disappeared), the BESS keeps
+    // covering them: the limit is the larger of the two capacities.
+    let excess = station - capacity(before).max(capacity(after));
     match excess > EPS {
         true => Err(format!("transition: the grid could see {station} kW")),
         false => Ok(excess),

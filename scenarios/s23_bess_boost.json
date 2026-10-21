@@ -1,0 +1,16 @@
+{
+  "name": "S23 BESS boost",
+  "why": "Above the 10 % floor, the BESS adds its 200 kW to the 400 kW grid: two vehicles get their full 300 kW instead of 200 kW each. The BESS discharges exactly what they draw beyond the grid, so the grid import stays at 400 kW and nothing is exported.",
+  "config": { "grid_kw": 400, "chargers": [
+    { "id": "CP1", "max_kw": 300, "connectors": [ { "id": 1 }, { "id": 2 } ] },
+    { "id": "CP2", "max_kw": 300, "connectors": [ { "id": 1 }, { "id": 2 } ] } ],
+    "bess": { "capacity_kwh": 200, "max_kw": 200 } },
+  "steps": [
+    { "soc": 0.5, "expect": { "capacity_kw": 600, "bess_mode": "charging", "bess_kw": 200, "grid_import_kw": 200 } },
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 300 }, "bess_mode": "charging", "bess_kw": 100, "grid_import_kw": 400 } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 300, "B": 300 }, "allocated_kw": 600, "bess_mode": "discharging",
+                  "bess_kw": 200, "grid_import_kw": 400 } }
+  ]
+}

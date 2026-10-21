@@ -33,7 +33,24 @@ pub fn kw_to_w(kw: f64) -> Option<Watts> {
 pub struct Config {
     pub grid_w: Watts,
     pub chargers: Vec<Charger>,
+    /// Optional on-site battery.
+    pub bess: Option<Bess>,
 }
+
+/// Battery energy storage system (BESS). It regulates the flow at the grid connection locally:
+/// it discharges only what the site consumes beyond the grid (never exports) and charges only
+/// with the headroom left by the vehicles.
+#[derive(Debug, Clone, Copy)]
+pub struct Bess {
+    /// Energy capacity, in watt-hours.
+    pub capacity_wh: u64,
+    /// Maximum charge and discharge power.
+    pub max_w: Watts,
+}
+
+/// BESS state of charge below which the station stops counting on its boost. Our own rule,
+/// above the BMS's hardware cut-off, so that the boost never disappears without warning.
+pub const MIN_SOC: f64 = 0.10;
 
 /// A charger: its power is shared between its connectors.
 #[derive(Debug)]
@@ -58,6 +75,14 @@ pub struct Connector {
 struct RawConfig {
     grid_kw: f64,
     chargers: Vec<RawCharger>,
+    bess: Option<RawBess>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBess {
+    capacity_kwh: f64,
+    max_kw: f64,
 }
 
 #[derive(Deserialize)]
@@ -126,7 +151,19 @@ impl Config {
                 connectors,
             });
         }
-        Ok(Config { grid_w, chargers })
+        let bess = match raw.bess {
+            Some(b) => Some(Bess {
+                // kWh → Wh is the same ×1000 as kW → W.
+                capacity_wh: positive(b.capacity_kwh, "bess capacity")?,
+                max_w: positive(b.max_kw, "bess")?,
+            }),
+            None => None,
+        };
+        Ok(Config {
+            grid_w,
+            chargers,
+            bess,
+        })
     }
 }
 
@@ -206,6 +243,15 @@ impl Slot {
     }
 }
 
+/// What the BESS does: one flow at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BessMode {
+    Charging,
+    Discharging,
+    Idle,
+}
+
 /// Why an event was rejected.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EventError {
@@ -215,6 +261,10 @@ pub enum EventError {
     UnknownCharger,
     /// An acknowledgement for a version that was never sent.
     FutureVersion,
+    /// A BESS update on a station without BESS.
+    NoBess,
+    /// A state of charge outside 0..=1.
+    InvalidSoc,
 }
 
 /// Kind of an accepted event.
@@ -226,6 +276,8 @@ pub enum EventKind {
     SessionEnded,
     /// A charger acknowledged its setpoints.
     Ack,
+    /// The BESS reported its state of charge.
+    BessSoc,
 }
 
 /// History entry: an accepted event and the allocation that resulted from it.
@@ -237,13 +289,15 @@ pub struct Record {
     pub seq: u64,
     pub at_ms: u64,
     pub kind: EventKind,
-    /// Charger index, in config order.
-    pub charger: usize,
+    /// Charger index, in config order (none for a BESS update).
+    pub charger: Option<usize>,
     /// Session events only: the session, its connector index, and its demand after the event
     /// (its last demand for `SessionEnded`).
     pub session: Option<(Uuid, usize, Watts)>,
     /// `Ack` only: the version acknowledged.
     pub version: Option<u64>,
+    /// `BessSoc` only: the state of charge reported.
+    pub soc: Option<f64>,
     /// Granted setpoint of every active session right after the event.
     pub setpoints: Vec<(Uuid, Watts)>,
 }
@@ -254,9 +308,10 @@ pub const HISTORY_CAP: usize = 10_000;
 /// What an accepted event is about; `apply` completes it into a [`Record`].
 struct Event {
     kind: EventKind,
-    charger: usize,
+    charger: Option<usize>,
     session: Option<(Uuid, usize, Watts)>,
     version: Option<u64>,
+    soc: Option<f64>,
 }
 
 /// The whole station: static config, live state of every connector, recent history.
@@ -267,6 +322,8 @@ pub struct Station {
     pub slots: Vec<Vec<Slot>>,
     /// Delivery state of each charger, in config order.
     pub links: Vec<ChargerLink>,
+    /// BESS state of charge (0..=1) as last reported by its BMS; `None` until then.
+    pub soc: Option<f64>,
     /// Latest accepted events, oldest first (at most `history_cap`).
     pub history: VecDeque<Record>,
     history_cap: usize,
@@ -300,6 +357,7 @@ impl Station {
             config,
             slots,
             history: VecDeque::new(),
+            soc: None,
             history_cap: HISTORY_CAP,
             last_seq: 0,
         }
@@ -322,7 +380,8 @@ impl Station {
         let id = Uuid::new_v4();
         let event = Event {
             kind: EventKind::SessionStarted,
-            charger: c,
+            charger: Some(c),
+            soc: None,
             session: Some((id, k, demand_w)),
             version: None,
         };
@@ -348,7 +407,8 @@ impl Station {
         let (c, k) = self.find_session(id).ok_or(EventError::UnknownSession)?;
         let event = Event {
             kind: EventKind::DemandChanged,
-            charger: c,
+            charger: Some(c),
+            soc: None,
             session: Some((id, k, demand_w)),
             version: None,
         };
@@ -366,7 +426,8 @@ impl Station {
         let demand_w = self.slots[c][k].session.as_ref().map_or(0, |s| s.demand_w);
         let event = Event {
             kind: EventKind::SessionEnded,
-            charger: c,
+            charger: Some(c),
+            soc: None,
             session: Some((id, k, demand_w)),
             version: None,
         };
@@ -389,9 +450,10 @@ impl Station {
         }
         let event = Event {
             kind: EventKind::Ack,
-            charger: c,
+            charger: Some(c),
             session: None,
             version: Some(version),
+            soc: None,
         };
         self.apply(now_ms, event, |s| {
             if version >= s.links[c].version {
@@ -404,6 +466,57 @@ impl Station {
     /// Chargers whose acknowledgement is awaited (indices, config order).
     pub fn awaited(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.links.len()).filter(|&c| self.links[c].awaiting)
+    }
+
+    /// The BESS reports its state of charge (an input from its BMS, never computed here). It
+    /// may change the capacity offered to vehicles, hence the allocation.
+    pub fn set_soc(&mut self, soc: f64, now_ms: u64) -> Result<(), EventError> {
+        if self.config.bess.is_none() {
+            return Err(EventError::NoBess);
+        }
+        if !(0.0..=1.0).contains(&soc) {
+            return Err(EventError::InvalidSoc);
+        }
+        let event = Event {
+            kind: EventKind::BessSoc,
+            charger: None,
+            session: None,
+            version: None,
+            soc: Some(soc),
+        };
+        self.apply(now_ms, event, |s| s.soc = Some(soc));
+        Ok(())
+    }
+
+    /// Power the BESS adds to the grid: its maximum while its SoC is above [`MIN_SOC`]
+    /// (anti over-discharge), nothing otherwise or while its SoC is unknown.
+    pub fn boost_w(&self) -> Watts {
+        match (self.config.bess, self.soc) {
+            (Some(bess), Some(soc)) if soc > MIN_SOC => bess.max_w,
+            _ => 0,
+        }
+    }
+
+    /// Power offered to vehicles: the grid plus the BESS boost.
+    pub fn capacity_w(&self) -> Watts {
+        self.config.grid_w + self.boost_w()
+    }
+
+    /// The BESS's single flow for the granted setpoints, `None` without BESS. It discharges
+    /// what vehicles draw beyond the grid; otherwise it charges with the headroom while not
+    /// full (vehicles first); otherwise it idles. Never both at once, never an export.
+    pub fn bess_flow(&self) -> Option<(BessMode, Watts)> {
+        let bess = self.config.bess?;
+        let grid = self.config.grid_w;
+        let vehicles: Watts = self.sessions().map(|(_, _, s)| s.setpoint_w).sum();
+        let charge = (grid.saturating_sub(vehicles)).min(bess.max_w);
+        Some(if vehicles > grid {
+            (BessMode::Discharging, vehicles - grid)
+        } else if self.soc.is_some_and(|soc| soc < 1.0) && charge > 0 {
+            (BessMode::Charging, charge)
+        } else {
+            (BessMode::Idle, 0)
+        })
     }
 
     /// A charger opened (`up`) or closed a setpoint channel. Shown to OPS only: it never changes
@@ -474,6 +587,7 @@ impl Station {
             charger: event.charger,
             session: event.session,
             version: event.version,
+            soc: event.soc,
             setpoints,
         });
     }
@@ -488,7 +602,7 @@ impl Station {
                 demand_w: s.demand_w,
             })
             .collect();
-        let targets = allocate(&self.config, &demands);
+        let targets = allocate(&self.config, self.capacity_w(), &demands);
         for (d, w) in demands.iter().zip(targets) {
             if let Some(session) = self.slots[d.charger][d.connector].session.as_mut() {
                 session.target_w = w;
@@ -717,6 +831,45 @@ mod tests {
     }
 
     #[test]
+    fn bess_boost_floor_and_modes() {
+        // The brief's station plus a 200 kWh / 200 kW BESS; CP1 connector 2 is capped at 150 kW.
+        let json = BRIEF.replace(
+            r#"] } ] }"#,
+            r#"] } ], "bess": { "capacity_kwh": 200, "max_kw": 200 } }"#,
+        );
+        let mut st = Station::new(Config::from_json(&json).unwrap(), 0);
+        assert_eq!(st.capacity_w(), 400 * KW, "SoC unknown: no boost");
+        assert_eq!(
+            st.bess_flow(),
+            Some((BessMode::Idle, 0)),
+            "SoC unknown: idle"
+        );
+
+        // Opportunistic charge: the vehicles first, the BESS takes the headroom.
+        st.set_soc(0.5, 0).unwrap();
+        assert_eq!(st.capacity_w(), 600 * KW);
+        let a = st.connect("CP1", 1, 100 * KW, 0).unwrap();
+        assert_eq!(st.bess_flow(), Some((BessMode::Charging, 200 * KW)));
+
+        // Boost: vehicles beyond the grid, the BESS discharges the difference.
+        let b = st.connect("CP2", 1, 300 * KW, 0).unwrap();
+        st.change_demand(a, 300 * KW, 0).unwrap();
+        settle(&mut st, 0);
+        assert_eq!((setpoint(&st, a), setpoint(&st, b)), (300 * KW, 300 * KW));
+        assert_eq!(st.bess_flow(), Some((BessMode::Discharging, 200 * KW)));
+
+        // Floor: below 10 % the boost is gone; vehicles share the grid, the BESS idles.
+        st.set_soc(0.09, 0).unwrap();
+        settle(&mut st, 0);
+        assert_eq!(st.capacity_w(), 400 * KW);
+        assert_eq!((setpoint(&st, a), setpoint(&st, b)), (200 * KW, 200 * KW));
+        assert_eq!(st.bess_flow(), Some((BessMode::Idle, 0)));
+
+        assert_eq!(st.set_soc(1.5, 0), Err(EventError::InvalidSoc));
+        assert_eq!(station().set_soc(0.5, 0), Err(EventError::NoBess));
+    }
+
+    #[test]
     fn charger_online_while_a_channel_is_open() {
         let mut st = station();
         let a = st.connect("CP1", 1, 300 * KW, 0).unwrap();
@@ -810,7 +963,10 @@ mod tests {
 
         // B leaves: where it was and its last demand are kept; only A remains.
         assert_eq!(h[5].kind, EventKind::SessionEnded);
-        assert_eq!((h[5].charger, h[5].session), (1, Some((b, 1, 300 * KW))));
+        assert_eq!(
+            (h[5].charger, h[5].session),
+            (Some(1), Some((b, 1, 300 * KW)))
+        );
         assert_eq!(h[5].setpoints.len(), 1);
     }
 

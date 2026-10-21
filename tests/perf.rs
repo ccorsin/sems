@@ -176,6 +176,7 @@ fn p3_allocator_scaling() {
         let config = Config {
             grid_w: 400_000 * sessions as u64,
             chargers,
+            bess: None,
         };
         // Varied demands, including zero, so that every branch is exercised.
         let demands: Vec<Demand> = (0..sessions)
@@ -189,7 +190,11 @@ fn p3_allocator_scaling() {
         let times: Vec<Duration> = (0..ITERATIONS)
             .map(|_| {
                 let start = Instant::now();
-                black_box(allocate(black_box(&config), black_box(&demands)));
+                black_box(allocate(
+                    black_box(&config),
+                    config.grid_w,
+                    black_box(&demands),
+                ));
                 start.elapsed()
             })
             .collect();

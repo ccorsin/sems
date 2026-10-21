@@ -1,0 +1,16 @@
+{
+  "name": "S25 BESS opportunistic charge",
+  "why": "The BESS charges only with what the vehicles leave of the grid (vehicles first), up to its 200 kW, and idles when full or while its SoC is unknown. One flow at a time, and the grid import never exceeds 400 kW.",
+  "config": { "grid_kw": 400, "chargers": [
+    { "id": "CP1", "max_kw": 300, "connectors": [ { "id": 1 }, { "id": 2 } ] },
+    { "id": "CP2", "max_kw": 300, "connectors": [ { "id": 1 }, { "id": 2 } ] } ],
+    "bess": { "capacity_kwh": 200, "max_kw": 200 } },
+  "steps": [
+    { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 100 },
+      "expect": { "setpoints": { "A": 100 }, "capacity_kw": 400, "bess_mode": "idle", "grid_import_kw": 100 } },
+    { "soc": 0.5, "expect": { "bess_mode": "charging", "bess_kw": 200, "grid_import_kw": 300 } },
+    { "change": { "session": "A", "demand_kw": 300 },
+      "expect": { "setpoints": { "A": 300 }, "bess_mode": "charging", "bess_kw": 100, "grid_import_kw": 400 } },
+    { "soc": 1.0, "expect": { "bess_mode": "idle", "bess_kw": 0, "grid_import_kw": 300 } }
+  ]
+}
