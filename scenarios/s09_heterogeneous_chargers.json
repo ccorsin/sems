@@ -1,14 +1,14 @@
 {
   "name": "S09 heterogeneous chargers",
-  "why": "The program adapts to the station's infrastructure: a 300 kW DC charger, a 50 kW DC charger and a 22 kW AC charger on one site.",
+  "why": "The program adapts to the station's infrastructure: a 300 kW DC charger, a 50 kW DC charger and a 22 kW AC charger on one site. The small chargers are served in full and the big one takes everything it can.",
   "config": { "grid_kw": 400, "chargers": [
     { "id": "HPC", "max_kw": 300, "connectors": [ { "id": 1, "type": "CCS" }, { "id": 2, "type": "CCS" } ] },
     { "id": "DC50", "max_kw": 50, "connectors": [ { "id": 1, "type": "CCS" } ] },
     { "id": "AC22", "max_kw": 22, "connectors": [ { "id": 1, "type": "Type2" } ] } ] },
   "steps": [
     { "connect": { "as": "A", "charger": "HPC", "connector": 1, "demand_kw": 300 }, "expect": { "setpoints": { "A": 300 } } },
-    { "connect": { "as": "B", "charger": "AC22", "connector": 1, "demand_kw": 22 }, "expect": { "setpoints": { "A": 200, "B": 22 } } },
+    { "connect": { "as": "B", "charger": "AC22", "connector": 1, "demand_kw": 22 }, "expect": { "setpoints": { "A": 300, "B": 22 } } },
     { "connect": { "as": "C", "charger": "DC50", "connector": 1, "demand_kw": 50 },
-      "expect": { "setpoints": { "A": 133.333, "B": 22, "C": 50 }, "allocated_kw": 205.333 } }
+      "expect": { "setpoints": { "A": 300, "B": 22, "C": 50 }, "allocated_kw": 372 } }
   ]
 }

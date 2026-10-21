@@ -14,15 +14,14 @@
 //! fairness, churn, potential transient overshoot), worst case per scenario, and prints a
 //! summary table: the baseline to compare versions of the algorithm against.
 
+mod common;
 use actix_web::{test, App};
+use common::checks::{check_consistency, check_history, check_invariant, num, optimum_kw, EPS};
 use sems::{api, model::Config, model::Station};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs};
 use uuid::Uuid;
-
-/// Tolerance when comparing kW values: 1 W.
-const EPS: f64 = 0.001;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,6 +203,7 @@ async fn run(scenario: &Scenario) -> Result<Metrics, String> {
         )
         .await;
         check_invariant(&status).map_err(at)?;
+        check_consistency(&status).map_err(at)?;
         let is_event = accepted.is_some();
         check_history(&mut last_seq, accepted, &latest, &status).map_err(at)?;
         check_expect(&step.expect, &status, &sessions).map_err(at)?;
@@ -261,10 +261,10 @@ impl Metrics {
     ) -> HashMap<String, f64> {
         let grid = num(&status["grid_kw"]);
         let allocated = num(&status["allocated_kw"]);
-        let (mut optimum, mut demand, mut ratios) = (0.0, 0.0, Vec::new());
+        let optimum = optimum_kw(status);
+        let (mut demand, mut ratios) = (0.0, Vec::new());
         let mut setpoints = HashMap::new();
         for charger in status["chargers"].as_array().unwrap() {
-            let mut deliverable = 0.0; // What this charger's sessions could take.
             for connector in charger["connectors"].as_array().unwrap() {
                 let session = &connector["session"];
                 let key = format!("{}/{}", charger["id"], connector["id"]);
@@ -273,15 +273,12 @@ impl Metrics {
                     continue;
                 }
                 let d = num(&session["demand_kw"]);
-                deliverable += d.min(num(&connector["max_kw"]));
                 demand += d;
                 if d > 0.0 {
                     ratios.push(num(&session["setpoint_kw"]) / d);
                 }
             }
-            optimum += deliverable.min(num(&charger["max_kw"]));
         }
-        let optimum = optimum.min(grid);
 
         let pct = |part: f64, whole: f64| {
             if whole > 0.0 {
@@ -348,80 +345,6 @@ impl Metrics {
     }
 }
 
-/// History invariant: an accepted event adds exactly one entry, of the right kind and session,
-/// whose resulting allocation matches `/status`; a rejected event (or none) adds nothing.
-fn check_history(
-    last_seq: &mut u64,
-    accepted: Option<(&str, Value)>,
-    latest: &[Value],
-    status: &Value,
-) -> Result<(), String> {
-    let seq = latest.first().map_or(0, |e| e["seq"].as_u64().unwrap_or(0));
-    let Some((kind, session_id)) = accepted else {
-        return match seq == *last_seq {
-            true => Ok(()),
-            false => Err(format!(
-                "history: no accepted event, yet seq went {last_seq} → {seq}"
-            )),
-        };
-    };
-    if seq != *last_seq + 1 {
-        return Err(format!(
-            "history: expected seq {}, got {seq}",
-            *last_seq + 1
-        ));
-    }
-    let entry = &latest[0];
-    if entry["kind"] != kind || entry["session_id"] != session_id {
-        return Err(format!(
-            "history: expected {kind} for {session_id}, got {entry}"
-        ));
-    }
-    let (recorded, live) = (
-        num(&entry["result"]["allocated_kw"]),
-        num(&status["allocated_kw"]),
-    );
-    if (recorded - live).abs() > EPS {
-        return Err(format!(
-            "history: result {recorded} kW differs from /status {live} kW"
-        ));
-    }
-    *last_seq = seq;
-    Ok(())
-}
-
-/// Safety invariant, checked on the API output after every step.
-fn check_invariant(status: &Value) -> Result<(), String> {
-    let mut station_total = 0.0;
-    for charger in status["chargers"].as_array().unwrap() {
-        let mut charger_total = 0.0;
-        for connector in charger["connectors"].as_array().unwrap() {
-            let session = &connector["session"];
-            if session.is_null() {
-                continue;
-            }
-            let (setpoint, demand) = (num(&session["setpoint_kw"]), num(&session["demand_kw"]));
-            if setpoint > demand + EPS || setpoint > num(&connector["max_kw"]) + EPS {
-                return Err(format!(
-                    "invariant: setpoint {setpoint} kW above demand or connector limit"
-                ));
-            }
-            charger_total += setpoint;
-        }
-        if charger_total > num(&charger["max_kw"]) + EPS {
-            return Err(format!(
-                "invariant: charger {} overloaded ({charger_total} kW)",
-                charger["id"]
-            ));
-        }
-        station_total += charger_total;
-    }
-    if station_total > num(&status["grid_kw"]) + EPS {
-        return Err(format!("invariant: grid overloaded ({station_total} kW)"));
-    }
-    Ok(())
-}
-
 fn check_expect(
     expect: &Expect,
     status: &Value,
@@ -480,8 +403,4 @@ fn check_expect(
         }
     }
     Ok(())
-}
-
-fn num(v: &Value) -> f64 {
-    v.as_f64().unwrap_or(f64::NAN)
 }

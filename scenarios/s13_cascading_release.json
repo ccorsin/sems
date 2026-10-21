@@ -1,6 +1,6 @@
 {
   "name": "S13 cascading release",
-  "why": "Power released by departures and a demand drop flows across several vehicles and chargers. In V1 the drop at step 6 leaves 113.3 kW unused (V2 should not).",
+  "why": "Power released by departures and a demand drop flows across several vehicles and chargers: when C drops to 20 kW, D (same charger) and B (other charger) share what C left. V1 left 113.3 kW unused at that step.",
   "config": "config/station.json",
   "steps": [
     { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 } },
@@ -10,7 +10,7 @@
       "expect": { "setpoints": { "A": 100, "B": 100, "C": 100, "D": 100 } } },
     { "disconnect": "A", "expect": { "setpoints": { "B": 133.333, "C": 133.333, "D": 133.333 } } },
     { "change": { "session": "C", "demand_kw": 20 },
-      "expect": { "setpoints": { "B": 133.333, "C": 20, "D": 133.333 }, "allocated_kw": 286.666 } },
-    { "disconnect": "D", "expect": { "setpoints": { "B": 200, "C": 20 }, "allocated_kw": 220 } }
+      "expect": { "setpoints": { "B": 190, "C": 20, "D": 190 }, "allocated_kw": 400 } },
+    { "disconnect": "D", "expect": { "setpoints": { "B": 300, "C": 20 }, "allocated_kw": 320 } }
   ]
 }

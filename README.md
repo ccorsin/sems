@@ -8,7 +8,8 @@ leaves).
 Written in Rust (actix-web). The design process, every decision and the alternatives considered
 are traced step by step in [`JOURNAL.md`](JOURNAL.md).
 
-> Current version: **V1** — capped equal-share allocation, REST API. See the [roadmap](#roadmap).
+> Current version: **V2** — max-min fair water-filling: no power left unused while a vehicle
+> could take it. V1 (capped equal share) is on branch `v1`. See the [roadmap](#roadmap).
 
 ## Quick start
 
@@ -51,10 +52,13 @@ The server logs one line per accepted event on stdout (`docker compose logs -f s
 With Docker only:
 
 ```bash
-# All tests: unit, scenarios, push
+# All tests: unit, scenarios, randomized, push
 docker compose run --rm test
 # Scenarios one by one, with their metrics and the summary table
 docker compose run --rm test cargo test --test scenarios -- --nocapture
+# Randomized test on more stations (default 50), or replay one seed after a failure
+docker compose run --rm -e SEMS_RUNS=1000 test cargo test --test random
+docker compose run --rm -e SEMS_SEED=42 test cargo test --test random
 # Performance (release build inside the container: first run takes a few minutes)
 docker compose run --rm test cargo test --release --test perf -- --ignored --nocapture --test-threads=1
 ```
@@ -69,9 +73,15 @@ dev machine: P1 max ≈ 2 ms, P2 ≈ 2,500 events/s); the figures below were mea
   allocation algorithm, malformed requests.
 - **Scenarios** (`scenarios/*.json`): event sequences replayed through the API, with expected
   setpoints, totals, statuses and HTTP codes. After **every step of every scenario** the runner
-  checks two invariants: **safety** (no setpoint above its demand or connector, no charger or
-  grid overload) and **history** (an accepted event adds exactly one `/events` entry whose
-  resulting allocation matches `/status`; a rejected event adds none).
+  checks three properties: **safety** (no setpoint above its demand or connector, no charger or
+  grid overload), **history** (an accepted event adds exactly one `/events` entry whose
+  resulting allocation matches `/status`; a rejected event adds none) and **consistency**
+  (`/status` totals and statuses match its sessions).
+- **Randomized** (`tests/random.rs`): random stations (1–5 chargers of 7–350 kW, 10–1500 kW grid)
+  and 100 random events each, including invalid targets and absurd demands. A shadow model
+  predicts every HTTP code; the same properties are checked after every event, plus **no waste
+  beyond rounding** (< 1 W per session). Seeded and reproducible: a failure prints its seed.
+  It tests what no hand-written scenario imagined.
 - **Push** (`tests/push.rs`): a real server on a random port, real WebSocket and HTTP clients.
   A charger is told its new setpoint when *another* charger's event changes it, and is not
   disturbed when it does not.
@@ -89,14 +99,15 @@ dev machine: P1 max ≈ 2 ms, P2 ≈ 2,500 events/s); the figures below were mea
 | S06 | Full station | No limit exceeded at any level; rounding down stays below the grid |
 | S07 | Demand down then up | Both directions go through the same recomputation |
 | S08 | Demand above connector limit | The connector level of the cascade |
-| S09 | Heterogeneous chargers | 300 kW DC, 50 kW DC and 22 kW AC on one site |
-| S10 | V1 known waste | Documents the V1 limitation (fixed in V2) |
+| S09 | Heterogeneous chargers | 300 kW DC, 50 kW DC and 22 kW AC on one site, enough grid for all |
+| S10 | Saturated charger's share goes to the other | Nested limits: what a full charger cannot take goes to another charger |
 | S11 | Invalid events | Clear error codes, state untouched by rejected events |
 | S12 | Increase under contention | An increase is granted only within what is available |
 | S13 | Cascading release | Released power across several vehicles and chargers |
 | S14 | Zero demand | A full vehicle still plugged in takes no share |
 | S15 | Plugged in, not charging | Status `charging` → `suspended_ev` → `charging` for OPS |
 | S16 | Absurd demand values | Regression: powers above 1 GW are rejected (422) instead of overflowing |
+| S17 | Heterogeneous chargers under contention | Same mix as S09 on a 100 kW grid: the small AC charger is served in full, the others share the rest |
 
 Each file carries its own `why`. To add a scenario, drop a JSON file in `scenarios/`: it is
 picked up automatically. Format:
@@ -195,10 +206,30 @@ never restarts, so a gap reveals dropped entries. Rejected events are not record
 Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
 
 - **Cascading limits** grid > charger > connector > vehicle, all enforced at once.
-- **V1 allocation — capped equal share**:
-  `setpoint = min(demand, connector, grid / n, charger / n_charger)`, where only sessions with a
-  non-zero demand count. Safe by construction; known limitation: power unused by one session is
-  not redistributed (see S10, fixed in V2).
+- **Allocation (V2) — max-min fair water-filling.** Picture each session as a glass as tall as
+  what it can take; power is poured into all glasses at the same level. A small glass fills up
+  first and what it does not take keeps raising the others. Result: no power is left unused
+  while a vehicle could take it, and nobody can get more without taking from someone served
+  less. The cascade takes two fillings:
+
+  ```
+  cap        = min(demand, connector)
+  μ_charger  = fill(charger max, caps of its sessions)     ← level inside each charger
+  cap'       = min(cap, μ_charger)
+  λ_grid     = fill(grid, all cap')                         ← level across the station
+  setpoint   = min(cap', λ_grid)
+  ```
+
+  `fill` sorts the caps and serves in full every cap below the equal share of what is left;
+  the first cap above it sets the level. O(n log n), rounded down (at most n − 1 W unused).
+  Example (S10, grid 500 kW): A and B on CP1 (300 kW) are capped at 150 kW each by their
+  charger, so C on CP2 takes the remaining 200 kW.
+- **V1 allocation — capped equal share** (branch `v1`):
+  `min(demand, connector, grid / n, charger / n_charger)`. Simple and safe, but power left by one
+  session was not redistributed: up to 166.7 kW wasted in our scenarios.
+  Rejected alternatives: proportional to demand (favours big requests), first come first served
+  (unfair), linear programming (oversized); weighted max-min is the natural extension for
+  priorities.
 - **Integer watts internally, rounded down**: sums can never exceed a limit by rounding.
 - **Full recomputation on every event**, under a single lock: the "Σ ≤ grid" invariant is
   global, and the computation takes microseconds.
@@ -226,21 +257,23 @@ machine, so these are upper bounds; max values vary with OS scheduling.
 
 | Test | What | p50 | p99 | max |
 |---|---|---|---|---|
-| **P1** | Event on one charger → new setpoint received over WebSocket by **another** charger (200 runs) | 155–171 µs | 282–464 µs | 444–582 µs |
-| **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.0–1.2 ms | 3.0–3.4 ms | 3.6–6.2 ms |
-| **P3** | Allocation alone, 4 sessions | 0.4–0.6 µs | 1.7–3.5 µs | ≤ 0.4 ms |
-| | Allocation alone, 100 sessions | 2.8 µs | 6–19 µs | ≤ 0.7 ms |
-| | Allocation alone, 10,000 sessions | 248–255 µs | 0.56–0.63 ms | ≤ 1.4 ms |
+| **P1** | Event on one charger → new setpoint received over WebSocket by **another** charger (200 runs) | 160–168 µs | 358–396 µs | 408–513 µs |
+| **P2** | 8 concurrent clients × 500 demand changes on 20 sessions: per-request latency | 1.0–1.1 ms | 2.9–3.5 ms | 4.5 ms (one 35 ms outlier) |
+| **P3** | Allocation alone, 4 sessions | 1.0 µs | 6–7 µs | ≤ 77 µs |
+| | Allocation alone, 100 sessions | 13 µs | 35–44 µs | ≤ 79 µs |
+| | Allocation alone, 10,000 sessions | 1.3 ms | 1.9–2.2 ms | ≤ 2.6 ms |
 
-- **P1, the brief's requirement** (< 1 s): the worst case measured is under 0.6 ms, about
-  1,700 times below the budget.
-- **P2**: **5,300–5,900 events/s** with the safety invariant checked on every one of the
+- **P1, the brief's requirement** (< 1 s): the worst case measured is about 0.5 ms, some
+  2,000 times below the budget.
+- **P2**: **5,600–5,900 events/s** with the safety invariant checked on every one of the
   4,000 responses, and every event found in `/events`. A real station sees a few events per
   second: this is headroom, not a target. Each response carries the full station state,
   which is part of this cost.
-- **P3**: linear growth; computation is never the bottleneck.
+- **P3**: the water-filling (sort, O(n log n)) is about 5 times slower than V1's equal share
+  (250 µs at 10,000 sessions), yet **end-to-end latency is unchanged** (V1: P1 max 444–582 µs,
+  P2 5,300–5,900 events/s): computation is never the bottleneck, the network is.
 
-## Allocation metrics (V1 baseline)
+## Allocation metrics: V1 → V2
 
 Computed by the scenario runner (`cargo test --test scenarios -- --nocapture`), worst case
 over each scenario's steps. Optimum = the most power deliverable within every limit:
@@ -255,6 +288,19 @@ over each scenario's steps. Optimum = the most power deliverable within every li
 | Churn (setpoints/event) | Setpoints changed per accepted event: how many chargers are disturbed |
 | Overshoot (kW) | Grid overload if every charger applied the larger of its old and new setpoint during a transition |
 
+**What changed** (scenarios whose metrics moved; the full V1 table is in `JOURNAL.md`, step 6):
+
+| Scenario | Waste V1 → V2 (kW) | Efficiency V1 → V2 (%) | Fairness V1 → V2 | Churn V1 → V2 (setpoints/event) | Overshoot V1 → V2 (kW) |
+|---|---|---|---|---|---|
+| S07 demand down then up | 100.0 → **0.0** | 71.4 → **100.0** | 0.96 → 1.00 | 1.2 → 1.8 | 100.0 → 100.0 |
+| S09 heterogeneous chargers | 166.7 → **0.0** | 55.2 → **100.0** | 0.91 → 1.00 | 1.7 → 1.0 | 0.0 → 0.0 |
+| S10 saturated charger's share | 33.3 → **0.0** | 93.3 → **100.0** | 1.00 → 0.98 | 1.3 → 1.3 | 0.0 → 0.0 |
+| S12 increase under contention | 100.0 → **0.0** | 71.4 → **100.0** | 0.96 → 1.00 | 1.0 → 1.5 | 0.0 → 100.0 |
+| S13 cascading release | 113.3 → **0.0** | 68.8 → **100.0** | 0.85 → 0.95 | 2.4 → 2.7 | 100.0 → 113.3 |
+| S15 plugged in, not charging | 30.0 → **0.0** | 90.0 → **100.0** | 0.90 → 0.94 | 1.8 → 1.8 | 50.0 → 50.0 |
+
+**V2, all scenarios:**
+
 | Scenario | Waste max (kW) | Efficiency min (%) | Satisfaction min (%) | Fairness min | Churn avg (setpoints/event) | Overshoot max (kW) |
 |---|---|---|---|---|---|---|
 | S01 empty station | 0.0 | 100.0 | 100.0 | 1.00 | 0.0 | 0.0 |
@@ -263,27 +309,37 @@ over each scenario's steps. Optimum = the most power deliverable within every li
 | S04 two vehicles on different chargers | 0.0 | 100.0 | 66.7 | 1.00 | 1.5 | 100.0 |
 | S05 a vehicle leaves | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
 | S06 full station | 0.0 | 100.0 | 33.3 | 1.00 | 2.5 | 100.0 |
-| S07 demand decreases then increases | 100.0 | 71.4 | 66.7 | 0.96 | 1.2 | 100.0 |
+| S07 demand decreases then increases | 0.0 | 100.0 | 66.7 | 1.00 | 1.8 | 100.0 |
 | S08 demand above the connector limit | 0.0 | 100.0 | 50.0 | 1.00 | 1.0 | 0.0 |
-| S09 heterogeneous chargers | 166.7 | 55.2 | 55.2 | 0.91 | 1.7 | 0.0 |
-| S10 V1 known waste | 33.3 | 93.3 | 50.0 | 1.00 | 1.3 | 0.0 |
+| S09 heterogeneous chargers | 0.0 | 100.0 | 100.0 | 1.00 | 1.0 | 0.0 |
+| S10 saturated charger's share goes to the other charger | 0.0 | 100.0 | 50.0 | 0.98 | 1.3 | 0.0 |
 | S11 invalid events | 0.0 | 100.0 | 100.0 | 1.00 | 1.0 | 0.0 |
-| S12 demand increase under contention | 100.0 | 71.4 | 66.7 | 0.96 | 1.0 | 0.0 |
-| S13 cascading release | 113.3 | 68.8 | 33.3 | 0.85 | 2.4 | 100.0 |
+| S12 demand increase under contention | 0.0 | 100.0 | 66.7 | 1.00 | 1.5 | 100.0 |
+| S13 cascading release | 0.0 | 100.0 | 33.3 | 0.95 | 2.7 | 113.3 |
 | S14 zero demand takes no share | 0.0 | 100.0 | 66.7 | 1.00 | 1.7 | 100.0 |
-| S15 plugged in but not charging | 30.0 | 90.0 | 50.0 | 0.90 | 1.8 | 50.0 |
+| S15 plugged in but not charging | 0.0 | 100.0 | 50.0 | 0.94 | 1.8 | 50.0 |
 | S16 absurd demand values | 0.0 | 100.0 | 0.0 | 1.00 | 1.5 | 100.0 |
+| S17 heterogeneous chargers under contention | 0.0 | 100.0 | 26.9 | 0.74 | 1.7 | 39.0 |
 
-**Reading**: V1 is safe (the invariant holds at every step) but **wastes up to 166.7 kW**
-(S09: a small charger's unused share is not handed to the big one): V2 (water-filling) targets
-0 kW of waste everywhere. **Potential overshoot reaches 100 kW** whenever a share moves from
-one charger to another: this is the transition risk addressed by "decrease before increase" (V3).
+**Reading**
+
+- **Gain**: waste drops to **0 kW in every scenario** (V1: up to 166.7 kW) and efficiency is
+  100 % everywhere; the randomized test confirms it on random stations (< 1 W per session).
+- **Cost, assumed**: redistributing disturbs more chargers (churn up to +0.6 setpoints/event)
+  and moves more power between chargers, so the **potential transition overshoot grows**
+  (S12: 0 → 100 kW, S13: 100 → 113.3 kW). This makes "decrease before increase" (V3) the next
+  priority.
+- **Fairness must be read with care**: Jain's index compares service *ratios*, not what each
+  vehicle *could* get. In S17 it is 0.74 although the split is max-min optimal: the 300 kW
+  vehicle gets 39 kW (13 %) on a 100 kW grid, the 22 kW one is served in full (100 %). In S10
+  (0.98), C is served at 67 % and A and B at 50 % because their charger cannot give more.
+  A low index can mean "unequal requests", not "unfair system".
 
 ## Roadmap
 
 | Version | Content |
 |---|---|
 | **V1** ✅ | REST API, scenarios, Docker, WebSocket push of setpoints, `/events` history, allocation metrics, end-to-end performance tests |
-| V2 | Water-filling allocation: no waste, released power goes to the other sessions; randomized property test (random stations and events, invariants at every step) |
+| **V2** ✅ | Max-min fair water-filling: no waste, released power goes to the other sessions; randomized property test (random stations and events, properties at every step) |
 | V3 | "Decrease before increase" transitions, minimum viable power per session, offline chargers |
 | V4 | Battery storage (BESS): boost, 10% SoC floor, opportunistic charging |

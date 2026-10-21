@@ -1,10 +1,15 @@
 //! Power allocation: turns vehicle demands into setpoints that respect every limit
 //! (grid > charger > connector > vehicle).
 //!
-//! V1 policy — capped equal share: each session gets the smallest of its demand, its connector
-//! limit, an equal share of the grid and an equal share of its charger. Safe by construction
-//! (each term is a safe share of its level), but power left unused by one session is not
-//! redistributed to the others: that is the V2 improvement.
+//! V2 policy — max-min fair water-filling. Picture each session as a glass as tall as what it
+//! can take; power is poured into every glass at the same level. A small glass fills up first
+//! and what it does not take keeps raising the others. No power is left unused while a session
+//! could take it, and nobody can get more without taking from someone served less.
+//!
+//! The cascade is handled with two fillings: first inside each charger (its sessions share its
+//! power), then across the grid (every session, already lowered to its charger's level).
+//! Integer division rounds down, so no sum can exceed its limit (at most n − 1 W stay unused).
+//! The V1 capped equal share lives in the git history (branch `v1`).
 
 use crate::model::{Config, Watts};
 
@@ -16,29 +21,57 @@ pub struct Demand {
     pub demand_w: Watts,
 }
 
-/// Computes one setpoint per demand, in the same order.
-/// Integer division rounds down, so no sum can exceed its limit.
-pub fn allocate(config: &Config, demands: &[Demand]) -> Vec<Watts> {
-    // Sessions requesting nothing (e.g. battery full) take no share.
-    let mut active_per_charger = vec![0; config.chargers.len()];
-    for d in demands.iter().filter(|d| d.demand_w > 0) {
-        active_per_charger[d.charger] += 1;
+/// Water level: the highest `level` such that `Σ min(cap, level)` stays within `capacity`,
+/// or `Watts::MAX` when every cap fits (nobody is limited by this capacity).
+///
+/// Caps are taken in ascending order: one below the equal share of what is left is served in
+/// full; the first one above it sets the level, and every remaining cap stops there.
+pub fn fill(capacity: Watts, mut caps: Vec<Watts>) -> Watts {
+    caps.sort_unstable();
+    let mut remaining = capacity;
+    for (i, &cap) in caps.iter().enumerate() {
+        let share = remaining / (caps.len() - i) as Watts;
+        if cap > share {
+            return share;
+        }
+        remaining -= cap;
     }
-    let active: Watts = active_per_charger.iter().sum();
+    Watts::MAX
+}
 
-    let setpoints: Vec<Watts> = demands
+/// Computes one setpoint per demand, in the same order.
+pub fn allocate(config: &Config, demands: &[Demand]) -> Vec<Watts> {
+    // 1. Each session's own cap: what the vehicle accepts, within its connector.
+    //    A zero demand is a zero cap: it naturally takes nothing.
+    let caps: Vec<Watts> = demands
         .iter()
         .map(|d| {
-            if d.demand_w == 0 {
-                return 0;
-            }
-            let charger = &config.chargers[d.charger];
             d.demand_w
-                .min(charger.connectors[d.connector].max_w)
-                .min(config.grid_w / active)
-                .min(charger.max_w / active_per_charger[d.charger])
+                .min(config.chargers[d.charger].connectors[d.connector].max_w)
         })
         .collect();
+
+    // 2. Charger level: the sessions of each charger share its power.
+    let mut per_charger = vec![Vec::new(); config.chargers.len()];
+    for (d, &cap) in demands.iter().zip(&caps) {
+        per_charger[d.charger].push(cap);
+    }
+    let charger_level: Vec<Watts> = per_charger
+        .into_iter()
+        .zip(&config.chargers)
+        .map(|(caps, charger)| fill(charger.max_w, caps))
+        .collect();
+
+    // 3. Caps lowered to their charger's level.
+    let caps: Vec<Watts> = demands
+        .iter()
+        .zip(caps)
+        .map(|(d, cap)| cap.min(charger_level[d.charger]))
+        .collect();
+
+    // 4–5. Grid level: every session shares the grid, each within its lowered cap.
+    let grid_level = fill(config.grid_w, caps.clone());
+    let setpoints: Vec<Watts> = caps.into_iter().map(|cap| cap.min(grid_level)).collect();
 
     debug_assert!(
         within_limits(config, demands, &setpoints),
@@ -176,12 +209,49 @@ mod tests {
     }
 
     #[test]
-    fn v1_known_waste() {
-        // Grid 500 kW: CP1 caps A and B at 150 kW each, yet C only gets 500/3 instead of the
-        // 200 kW left. 34 kW wasted; V2 (water-filling) is expected to fix this.
+    fn fill_serves_small_caps_in_full_and_shares_the_rest() {
+        // 100 to share: 10 fits, then 90 / 2 = 45 each for the two big ones.
+        assert_eq!(fill(100, vec![80, 10, 80]), 45);
+        // Equal caps: plain equal share, rounded down.
+        assert_eq!(fill(400_000, vec![300_000; 3]), 133_333);
+        // Everything fits: no level.
+        assert_eq!(fill(400, vec![22, 50, 300]), Watts::MAX);
+        assert_eq!(fill(10, vec![]), Watts::MAX);
+        // Zero caps take nothing.
+        assert_eq!(fill(100, vec![0, 0, 300]), 100);
+    }
+
+    #[test]
+    fn saturated_charger_leaves_the_rest_to_others() {
+        // V1 gave 150 / 150 / 166.7 kW (33.3 kW wasted). CP1 cannot give A and B more than
+        // 150 kW each, so C takes the 200 kW left of the grid.
         let cfg = config(500, &[300, 300]);
         let setpoints = allocate(&cfg, &[d(0, 0, 300), d(0, 1, 300), d(1, 0, 300)]);
-        assert_eq!(setpoints, [150_000, 150_000, 166_666]);
+        assert_eq!(kw(setpoints), [150, 150, 200]);
+    }
+
+    #[test]
+    fn small_chargers_unused_share_goes_to_the_big_one() {
+        // V1 gave 133.3 / 22 / 50 kW. The 22 and 50 kW chargers are served in full and the
+        // 300 kW one takes everything it can.
+        let cfg = config(400, &[300, 22, 50]);
+        let setpoints = allocate(&cfg, &[d(0, 0, 300), d(1, 0, 22), d(2, 0, 50)]);
+        assert_eq!(kw(setpoints), [300, 22, 50]);
+    }
+
+    #[test]
+    fn demand_drop_is_redistributed() {
+        // V1 gave 50 / 200 kW: B now gets what A no longer takes, up to its charger.
+        let cfg = config(400, &[300, 300]);
+        assert_eq!(kw(allocate(&cfg, &[d(0, 0, 50), d(1, 0, 300)])), [50, 300]);
+    }
+
+    #[test]
+    fn smallest_demand_served_first() {
+        // Grid 100 kW, three chargers: 10 kW is served in full, the others share 90 kW.
+        let cfg = config(100, &[300, 300, 300]);
+        let setpoints = allocate(&cfg, &[d(0, 0, 80), d(1, 0, 10), d(2, 0, 80)]);
+        assert_eq!(kw(setpoints), [45, 10, 45]);
     }
 
     #[test]
