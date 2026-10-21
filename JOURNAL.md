@@ -29,7 +29,7 @@ the allocation that resulted from it.
 | V3.1 | Decrease before increase: decreases are published at once; increases wait until every charger with a pending decrease acknowledges its latest version (`POST /chargers/{id}/ack`, version = event `seq`) | 0 kW of transition overshoot on every transition; a charger that never acknowledges freezes increases (documented limitation) |
 | V3.2 | OPS view completed: each charger's `online` status (a setpoint WebSocket is open) with `online_since_ms`, and available power per charger | Every item the brief lists for OPS is in `/status`; going offline releases nothing |
 
-**Tests.** Unit tests on configuration, model and allocator; 20 declarative JSON scenarios, each
+**Tests.** Unit tests on configuration, model and allocator; 22 declarative JSON scenarios, each
 with its `why`, replayed through the API with four properties checked after every request
 (safety, transition, history, consistency) and allocation metrics per scenario; a seeded
 randomized test (random stations and events, including invalid requests and late, stale, future
@@ -944,3 +944,15 @@ fields).
   opens, offline once it closes, 300 kW kept), consistency check `available_kw = max_kw −
   allocated_kw` per charger in every scenario and random step. A deliberate bug (never marking
   a charger offline) makes the push test fail.
+
+## Step 16 — Two more scenarios; minimum power documented (2026-10-21)
+
+- **S21 — a pending decrease holds an unrelated increase**: A drops on CP1 (pending), B asks for
+  more on CP2; B waits although its increase would already fit. Shows the cost of the
+  station-wide, all-or-nothing barrier, by design.
+- **S22 — OPS view during a pending acknowledgement**: checks the whole exposed state during a
+  partial transition, not only setpoints: statuses (`suspended_evse` for the held vehicle),
+  targets, `pending_acks`, and station totals counting only what is granted.
+- **Minimum viable power per session: documented as not covered** (README limitations), with
+  the sketched rule. It cannot be a scenario since the feature does not exist; not needed for
+  the brief's station.

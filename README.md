@@ -128,6 +128,8 @@ dev machine: P1 max ≈ 2 ms, P2 ≈ 2,500 events/s); the figures below were mea
 | S18 | Increase waits for the acknowledgement | A decrease is published at once, the matching increase only after the acknowledgement; a departure frees power at once |
 | S19 | Stale acknowledgement | Acknowledging an older version releases nothing while a newer decrease is on its way |
 | S20 | Silent charger | Known limitation: a charger that never acknowledges freezes every increase (safety first) |
+| S21 | Pending decrease holds an unrelated increase | The barrier is station-wide: an increase elsewhere waits even when it would already fit |
+| S22 | OPS view during a pending acknowledgement | The exposed state (statuses, targets, pending chargers, totals) reflects a partial transition |
 
 Each file carries its own `why`. To add a scenario, drop a JSON file in `scenarios/`: it is
 picked up automatically. Format:
@@ -353,6 +355,10 @@ Full reasoning and rejected alternatives: [`JOURNAL.md`](JOURNAL.md).
 - One server per station. No authentication. State is lost on restart.
 - A setpoint received is assumed applied at once (no ramp time modelled); an acknowledgement
   confirms reception, not a measured power.
+- **No minimum viable power per session (not covered).** With many vehicles on a small grid,
+  shares can become too small to be useful. The sketched rule: a configurable minimum; sessions
+  admitted in arrival order while each can get it; the others wait at 0 kW as `suspended_evse`,
+  re-evaluated on every event. Not needed for the brief's station (at least 100 kW per vehicle).
 - A charger that never acknowledges freezes every increase on the station (S20); timeout and
   exclusion are the documented next step (see [Safe transitions](#safe-transitions-decrease-before-increase)).
 - The barrier is **station-wide and all or nothing**: a pending decrease on one charger also
@@ -428,7 +434,7 @@ over each scenario's steps. Optimum = the most power deliverable within every li
 | S13 cascading release | 113.3 → **0.0** |
 | S17 heterogeneous chargers under contention | 39.0 → **0.0** |
 
-**V3, all scenarios** (S01–S17 measured on the settled station; S18–S20 acknowledge manually,
+**V3, all scenarios** (S01–S17 measured on the settled station; S18–S22 acknowledge manually,
 so their figures include the time spent waiting for acknowledgements):
 
 | Scenario | Waste max (kW) | Efficiency min (%) | Satisfaction min (%) | Fairness min | Churn avg (setpoints/event) | Overshoot max (kW) |
@@ -453,6 +459,8 @@ so their figures include the time spent waiting for acknowledgements):
 | S18 increase waits for the acknowledgement | 200.0 | 50.0 | 33.3 | 0.50 | 1.2 | 0.0 |
 | S19 stale acknowledgement | 266.7 | 33.3 | 14.8 | 0.33 | 1.0 | 0.0 |
 | S20 silent charger freezes increases | 200.0 | 50.0 | 33.3 | 0.50 | 0.5 | 0.0 |
+| S21 pending decrease holds an unrelated increase | 150.0 | 50.0 | 50.0 | 0.74 | 0.8 | 0.0 |
+| S22 OPS view during a pending acknowledgement | 200.0 | 50.0 | 33.3 | 0.50 | 1.0 | 0.0 |
 
 **Reading**
 
@@ -464,7 +472,7 @@ so their figures include the time spent waiting for acknowledgements):
 - **V3 removes it**: overshoot is **0 kW on every transition of every scenario**, intermediate
   states included (the runner checks them before acknowledging), and the randomized test checks
   it with acknowledgements arriving late, stale or never.
-- **Price of V3's safety**: while a charger has not acknowledged, increases wait. S18–S20 show
+- **Price of V3's safety**: while a charger has not acknowledged, increases wait. S18–S22 show
   it: up to 266.7 kW unused while acknowledgements are pending (S19), and indefinitely if a
   charger stays silent (S20). With real chargers acknowledging within milliseconds, the
   settled figures (S01–S17) are what a station sees.
