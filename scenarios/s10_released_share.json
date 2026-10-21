@@ -1,6 +1,6 @@
 {
-  "name": "S10 V1 known waste",
-  "why": "Documents the V1 limitation: CP1 caps A and B at 150 kW each, yet C only gets 500/3 instead of the 200 kW left; 33.3 kW wasted. Expected to change in V2 (water-filling).",
+  "name": "S10 saturated charger's share goes to the other charger",
+  "why": "Nested limits: CP1 caps A and B at 150 kW each, so C on CP2 takes the 200 kW left of the 500 kW grid. V1 gave C only 500/3 = 166.7 kW and wasted 33.3 kW.",
   "config": { "grid_kw": 500, "chargers": [
     { "id": "CP1", "max_kw": 300, "connectors": [ { "id": 1 }, { "id": 2 } ] },
     { "id": "CP2", "max_kw": 300, "connectors": [ { "id": 1 }, { "id": 2 } ] } ] },
@@ -8,6 +8,6 @@
     { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 300 } },
     { "connect": { "as": "B", "charger": "CP1", "connector": 2, "demand_kw": 300 } },
     { "connect": { "as": "C", "charger": "CP2", "connector": 1, "demand_kw": 300 },
-      "expect": { "setpoints": { "A": 150, "B": 150, "C": 166.666 }, "allocated_kw": 466.666 } }
+      "expect": { "setpoints": { "A": 150, "B": 150, "C": 200 }, "allocated_kw": 500 } }
   ]
 }

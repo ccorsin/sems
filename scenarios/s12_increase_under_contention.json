@@ -1,11 +1,11 @@
 {
   "name": "S12 demand increase under contention",
-  "why": "An increase is granted only within what is available (here A's fair share of the saturated grid); the following decrease is not redistributed in V1.",
+  "why": "An increase is granted only within what is available: B first takes what A does not need; when A asks for more, B gives back down to an even split of the saturated grid; when A drops again, B takes the power back.",
   "config": "config/station.json",
   "steps": [
     { "connect": { "as": "A", "charger": "CP1", "connector": 1, "demand_kw": 100 }, "expect": { "setpoints": { "A": 100 } } },
-    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 }, "expect": { "setpoints": { "A": 100, "B": 200 } } },
+    { "connect": { "as": "B", "charger": "CP2", "connector": 1, "demand_kw": 300 }, "expect": { "setpoints": { "A": 100, "B": 300 }, "allocated_kw": 400 } },
     { "change": { "session": "A", "demand_kw": 300 }, "expect": { "setpoints": { "A": 200, "B": 200 }, "allocated_kw": 400 } },
-    { "change": { "session": "A", "demand_kw": 50 }, "expect": { "setpoints": { "A": 50, "B": 200 }, "allocated_kw": 250 } }
+    { "change": { "session": "A", "demand_kw": 50 }, "expect": { "setpoints": { "A": 50, "B": 300 }, "allocated_kw": 350 } }
   ]
 }

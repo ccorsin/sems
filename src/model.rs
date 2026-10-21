@@ -526,12 +526,12 @@ mod tests {
         assert_eq!(slot(&st, a).status_since_ms, 30);
         assert_eq!(slot(&st, b).session.as_ref().unwrap().setpoint_w, 300 * KW);
 
-        // A asks for power again (demand going up).
+        // A asks for power again (demand going up); B keeps what A does not take.
         st.change_demand(a, 100 * KW, 40).unwrap();
         assert_eq!(slot(&st, a).status(), Status::Charging);
         assert_eq!(slot(&st, a).status_since_ms, 40);
         assert_eq!(slot(&st, a).session.as_ref().unwrap().setpoint_w, 100 * KW);
-        assert_eq!(slot(&st, b).session.as_ref().unwrap().setpoint_w, 150 * KW);
+        assert_eq!(slot(&st, b).session.as_ref().unwrap().setpoint_w, 200 * KW);
 
         // B leaves: its connector is available again.
         st.disconnect(b, 50).unwrap();
@@ -596,7 +596,7 @@ mod tests {
         // A's demand drops: recorded with its new demand and the resulting split.
         assert_eq!(h[2].kind, EventKind::DemandChanged);
         assert_eq!((h[2].session_id, h[2].demand_w), (a, 100 * KW));
-        assert_eq!(h[2].setpoints, [(a, 100 * KW), (b, 150 * KW)]);
+        assert_eq!(h[2].setpoints, [(a, 100 * KW), (b, 200 * KW)]);
 
         // B leaves: where it was and its last demand are kept; only A remains.
         assert_eq!(h[3].kind, EventKind::SessionEnded);
