@@ -154,6 +154,6 @@ pub fn optimum_kw(status: &Value) -> f64 {
                 .sum();
             sessions.min(num(&charger["max_kw"]))
         })
-        .sum();
+        .fold(0.0, |a, b| a + b); // Not `sum()`: an empty f64 sum is -0.0, printed "-0.0".
     deliverable.min(num(&status["grid_kw"]))
 }

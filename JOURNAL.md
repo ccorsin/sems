@@ -700,3 +700,92 @@ the edge suffices). Regression: unit test on `kw_to_w` and scenario S16.
 Strengths kept: two invariants checked at every step independently of expected values, a
 mandatory `why` per scenario, real server and clients for push and performance, tests verified
 against deliberate bugs.
+
+---
+
+# V2 — No waste: max-min fair water-filling
+
+V1 is frozen on branch `v1`; V2 replaces its allocator (no double implementation in the code).
+
+## Step 8 — V2 design (2026-10-21)
+
+**Problem**: V1 is safe but wastes power (up to 166.7 kW in our scenarios): a session's unused
+share is not handed to the others. Goal: 0 kW of waste, cascade still enforced.
+
+**Fairness objective** — chosen: **max-min fairness** (raise the least served first, until
+nobody can get more without taking from someone served less). Rejected:
+
+| Option | Why not |
+|---|---|
+| Proportional to demand | Favours big requests: a 22 kW AC car rationed like a 300 kW DC one |
+| First come, first served | Unfair; the last car can get nothing |
+| Proportional fairness (maximise Σ log setpoint) | Needs a convex solver, hard to explain to OPS; close to max-min on our tree |
+| Maximise the total only | Same total as max-min (both reach the optimum), without any fairness guarantee |
+| Linear programming | Oversized, heavy dependency |
+| Stack-aware discrete allocation | Stacks are out of scope (documented assumption) |
+
+Weighted max-min (a weight per session) is the natural extension if priorities appear.
+
+**Computation method** — chosen: **exact water-filling over sorted caps**, O(n log n).
+Rejected: simulated progressive filling (slow, approximate), bisection on the level
+(approximate), successive linear programs (only needed for non-nested constraints),
+incremental recomputation (premature: a full computation takes microseconds).
+
+**Algorithm** (two fillings for the cascade):
+
+```
+fill(capacity, caps) = highest level μ with Σ min(cap, μ) ≤ capacity ("unlimited" if all fit)
+cap        = min(demand, connector)
+μ_charger  = fill(charger max, caps of its sessions)
+cap'       = min(cap, μ_charger)
+λ_grid     = fill(grid, all cap')
+setpoint   = min(cap', λ_grid)
+```
+
+**Decisions**: floor rounding kept (at most n − 1 W unused, accepted); V1 kept in git history
+only; scenario expectations updated so that the diff between branches shows the gain; the
+randomized test (postponed from step 7) is part of V2.
+
+## Step 9 — V2.1: the water-filling allocator (2026-10-21)
+
+**Scope**: `src/allocator.rs` (`fill`, new `allocate`), updated expectations in 2 model tests and
+6 scenarios (S10 renamed `s10_released_share.json`), 5 new allocator unit tests.
+
+- **Simpler than V1 on one point**: a zero demand is a zero cap and naturally takes nothing; the
+  V1 special case disappears.
+- **The V1 expectations failed exactly where V1 wasted power** (S07, S09, S10, S12, S13, S15):
+  e.g. S10 466.666 → 500 kW, S13 286.666 → 400 kW.
+- **Metrics**: waste 0 kW in every scenario, efficiency 100 %. Costs measured and assumed: churn
+  up (S07 1.2 → 1.8, S13 2.4 → 2.7 setpoints/event), potential transition overshoot up (S12
+  0 → 100 kW, S13 100 → 113.3 kW): V3's "decrease before increase" becomes more necessary.
+- **Jain's index needs care**: S10 drops to 0.98 although the split is max-min optimal (it
+  compares service ratios, not what each car *could* get). Documented in the README.
+- **Performance**: allocation alone ~5× slower (10,000 sessions: 250 µs → 1.3 ms; sort and small
+  allocations), end-to-end unchanged (P1 max 408–513 µs, P2 5,600–5,900 events/s). An
+  optimisation (avoid per-charger allocations) exists if ever needed; nothing justifies it now.
+
+## Step 10 — V2.2: randomized property test (2026-10-21)
+
+**Scope**: `tests/random.rs`, `tests/common/checks.rs` (checks shared with the scenario runner),
+scenario S17.
+
+- **Seeded SplitMix64 generator** (no dependency): random stations (1–5 chargers of 7–350 kW,
+  1–3 connectors, some with a lower limit, grid 10–1500 kW), 100 random events each: connects
+  (some on busy or unknown connectors), demand changes and disconnects (some on ended or unknown
+  sessions), demands mostly 0–400 kW with decimals, sometimes 0, the 1 GW limit or invalid.
+- **Shadow model** (which session is on which connector) predicts every HTTP code: 201, 200,
+  404, 409 or 422, never a 5xx.
+- **Checked after every event**: safety, history, `/status` consistency (new: totals and
+  statuses match the sessions; also added to the scenario runner), agreement with the shadow
+  model, waste < 1 W per session.
+- **Verified against deliberate bugs**, each caught with its seed and step: water level 1 W too
+  high (seed 2, step 3), 1 kW below the level (seed 1, step 2), charger level ignored (seed 4,
+  step 18: `CP4 overloaded (466.885 kW)`).
+- **Duration**: 200 stations took ~17 s in debug; default set to **50 stations (~4 s)**,
+  `SEMS_RUNS` plays more, `SEMS_SEED` replays one.
+- **S17 — heterogeneous chargers under contention**: S09's mix on a 100 kW grid. Since V2, S09
+  is a happy path (372 kW requested on 400 kW); S17 keeps a case where heterogeneous chargers
+  must share: 22 kW AC served in full, 39 kW each for the two DC chargers (V1 would have given
+  33.3 / 22 / 33.3 kW, 11.3 kW wasted). Its fairness index (0.74) illustrates the Jain caveat.
+- Cosmetic fix: an empty `f64` sum is `-0.0` in Rust, which printed "-0.0" kW of waste for S01;
+  `optimum_kw` now folds from `0.0`.
